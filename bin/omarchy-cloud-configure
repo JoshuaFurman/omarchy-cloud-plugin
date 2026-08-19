@@ -30,19 +30,19 @@ extra_flags=""
 
 save() {
   mkdir -p "$REMOTE_DIR"
-  cat >"$REMOTE_DIR/$REMOTE_NAME.conf" <<EOF
-# Written by omarchy-cloud-configure for the '$REMOTE_NAME' remote.
-# extra_flags is appended to the rclone mount command line.
-label="$label"
-extra_flags="$extra_flags"
-EOF
+  {
+    printf '# Written by omarchy-cloud-configure for the %q remote.\n' "$REMOTE_NAME"
+    echo "# extra_flags is appended to the rclone mount command line."
+    printf 'label=%q\n' "$label"
+    printf 'extra_flags=%q\n' "$extra_flags"
+  } >"$REMOTE_DIR/$REMOTE_NAME.conf"
 }
 
 # Mount flags are read at start, so a change only takes effect on a restart.
 remount() {
-  if systemctl --user is-active --quiet "rclone-mount@$REMOTE_NAME.service"; then
+  if "$MOUNT" is-active "$REMOTE_NAME"; then
     say "Restarting the mount so the change takes effect…"
-    systemctl --user restart "rclone-mount@$REMOTE_NAME.service"
+    "$MOUNT" restart "$REMOTE_NAME"
   fi
 }
 
@@ -97,7 +97,7 @@ configure_gdocs() {
 
 configure_autostart() {
   local now="off"
-  systemctl --user is-enabled --quiet "rclone-mount@$REMOTE_NAME.service" 2>/dev/null && now="on"
+  "$MOUNT" is-enabled "$REMOTE_NAME" 2>/dev/null && now="on"
 
   heading "Mount at login"
   echo "Currently: $now"
@@ -105,7 +105,7 @@ configure_autostart() {
 
   if [[ "$now" == "on" ]]; then
     if gum confirm "Stop mounting this at login?"; then
-      systemctl --user disable "rclone-mount@$REMOTE_NAME.service" >/dev/null 2>&1
+      "$MOUNT" disable "$REMOTE_NAME" >/dev/null 2>&1
       good "It will no longer mount at login."
     fi
   else

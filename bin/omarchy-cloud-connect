@@ -299,12 +299,12 @@ choose_gdocs_mode() {
 
 save_remote_config() {
   mkdir -p "$REMOTE_DIR"
-  cat >"$REMOTE_DIR/$REMOTE_NAME.conf" <<EOF
-# Written by omarchy-cloud-connect for the '$REMOTE_NAME' remote.
-# extra_flags is appended to the rclone mount command line.
-label="$PROVIDER_LABEL"
-extra_flags="$EXTRA_FLAGS"
-EOF
+  {
+    printf '# Written by omarchy-cloud-connect for the %q remote.\n' "$REMOTE_NAME"
+    echo "# extra_flags is appended to the rclone mount command line."
+    printf 'label=%q\n' "$PROVIDER_LABEL"
+    printf 'extra_flags=%q\n' "$EXTRA_FLAGS"
+  } >"$REMOTE_DIR/$REMOTE_NAME.conf"
 }
 
 # ---------------------------------------------------------------- mount
@@ -326,7 +326,7 @@ mount_it() {
   "$MOUNT" install-unit >/dev/null || abort "Could not install the systemd unit."
 
   if ! "$MOUNT" enable "$REMOTE_NAME"; then
-    abort "systemd could not start the mount. See: journalctl --user -u rclone-mount@$REMOTE_NAME"
+    abort "systemd could not start the mount. See: journalctl --user -u omarchy-cloud-mount@$REMOTE_NAME"
   fi
 
   # `systemctl enable --now` returns as soon as the unit is active, and with
@@ -338,7 +338,7 @@ mount_it() {
     waited=$((waited + 1))
     if ((waited >= 20)); then
       warn "The mount hasn't appeared yet. It may still be starting."
-      warn "Check with: systemctl --user status rclone-mount@$REMOTE_NAME"
+      warn "Check with: systemctl --user status omarchy-cloud-mount@$REMOTE_NAME"
       return 0
     fi
   done

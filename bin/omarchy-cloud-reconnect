@@ -6,6 +6,7 @@
 set -uo pipefail
 
 BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+MOUNT="$BIN_DIR/omarchy-cloud-mount"
 # shellcheck source=omarchy-cloud-ui.sh
 source "$BIN_DIR/omarchy-cloud-ui.sh"
 trap hold_open EXIT
@@ -20,7 +21,7 @@ echo
 # runs the same flow but rejects the flag.
 if rclone config update "$name" --no-output; then
   good "Signed in."
-  systemctl --user restart "rclone-mount@$name.service" 2>/dev/null || true
+  "$MOUNT" restart "$name" 2>/dev/null || true
 else
   bad "Sign-in did not complete."
   exit 1

@@ -15,6 +15,7 @@ import argparse
 import configparser
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,7 +42,8 @@ PROVIDER_LABELS = {
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-cloud"
 STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-cloud"
-UNIT_PREFIX = "rclone-mount@"
+UNIT_PREFIXES = ("omarchy-cloud-mount@", "rclone-mount@")
+REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 def run(command, timeout=5):
@@ -74,9 +76,22 @@ def config_path():
     return Path.home() / ".config" / "rclone" / "rclone.conf"
 
 
-def read_remotes(path):
-    """Parse remote names and types. Never returns secrets."""
-    if not path.exists():
+def managed_remote_names():
+    """Remote IDs created by this plugin, derived from its per-remote files."""
+    remote_dir = STATE_DIR / "remotes"
+    try:
+        return {
+            path.stem
+            for path in remote_dir.glob("*.conf")
+            if path.is_file() and REMOTE_NAME_PATTERN.fullmatch(path.stem)
+        }
+    except OSError:
+        return set()
+
+
+def read_remotes(path, managed_names):
+    """Parse managed remote names and types. Never returns secrets."""
+    if not path.exists() or not managed_names:
         return []
     parser = configparser.ConfigParser(interpolation=None)
     try:
@@ -86,6 +101,8 @@ def read_remotes(path):
 
     remotes = []
     for name in parser.sections():
+        if name not in managed_names:
+            continue
         backend = parser[name].get("type", "")
         remotes.append(
             {
@@ -136,19 +153,37 @@ def mounted_paths():
 
 
 def unit_states(names):
-    """One batched systemctl call for every remote's unit."""
+    """Read current and legacy user-unit state in one batched systemctl call."""
     states = {name: {"active": "inactive", "enabled": "disabled"} for name in names}
     if not names:
         return states
 
-    units = [f"{UNIT_PREFIX}{name}.service" for name in names]
+    units = [
+        f"{prefix}{name}.service"
+        for prefix in UNIT_PREFIXES
+        for name in names
+    ]
     code, out = run(
         ["systemctl", "--user", "show", "--property=Id,ActiveState,UnitFileState", *units]
     )
     if code != 0 and not out:
         return states
 
-    # `systemctl show` emits blank-line separated blocks, one per unit.
+    def priority(state):
+        active_rank = {
+            "active": 4,
+            "activating": 3,
+            "reloading": 3,
+            "failed": 2,
+            "deactivating": 1,
+            "inactive": 0,
+        }.get(state["active"], 0)
+        enabled_rank = 1 if state["enabled"] in ("enabled", "enabled-runtime") else 0
+        return active_rank, enabled_rank
+
+    # `systemctl show` emits blank-line separated blocks, one per unit. Prefer
+    # whichever generation is active; this keeps pre-0.2 mounts visible until
+    # the next explicit mount action migrates their owned template.
     for block in out.split("\n\n"):
         fields = {}
         for line in block.splitlines():
@@ -156,14 +191,17 @@ def unit_states(names):
                 key, _, value = line.partition("=")
                 fields[key] = value
         unit_id = fields.get("Id", "")
-        if not unit_id.startswith(UNIT_PREFIX):
+        prefix = next((item for item in UNIT_PREFIXES if unit_id.startswith(item)), "")
+        if not prefix:
             continue
-        name = unit_id[len(UNIT_PREFIX):].removesuffix(".service")
+        name = unit_id[len(prefix):].removesuffix(".service")
         if name in states:
-            states[name] = {
+            candidate = {
                 "active": fields.get("ActiveState", "inactive"),
                 "enabled": fields.get("UnitFileState", "disabled"),
             }
+            if priority(candidate) > priority(states[name]):
+                states[name] = candidate
     return states
 
 
@@ -267,11 +305,12 @@ def main():
         first = version_out.splitlines()[0].split()
         version = first[1] if len(first) > 1 else ""
 
-    remotes = read_remotes(config_path())
+    remotes = read_remotes(config_path(), managed_remote_names())
     live = mounted_paths()
     states = unit_states([r["name"] for r in remotes])
 
-    unit_file = Path.home() / ".config" / "systemd" / "user" / f"{UNIT_PREFIX}.service"
+    unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
+    unit_installed = any((unit_dir / f"{prefix}.service").exists() for prefix in UNIT_PREFIXES)
 
     rows = []
     for remote in remotes:
@@ -314,7 +353,7 @@ def main():
         "rcloneInstalled": True,
         "rcloneVersion": version,
         "mountRoot": str(root),
-        "unitInstalled": unit_file.exists(),
+        "unitInstalled": unit_installed,
         "remotes": rows,
     }))
 

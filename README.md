@@ -1,6 +1,6 @@
 # Omarchy Cloud Plugin
 
-![Preview](assets/preview.png)
+![Preview](preview.png)
 
 Mount Google Drive, Dropbox, OneDrive and other cloud storage as ordinary
 folders on Omarchy, with connection status in the bar.
@@ -17,19 +17,17 @@ Bar widget  ──▶  systemd user units  ──▶  rclone mount  ──▶  ~
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-cloud-plugin.git
-omarchy plugin enable furmware.cloud
+omarchy plugin add https://github.com/JoshuaFurman/omarchy-cloud-plugin.git --enable
 ```
 
-Plugins land disabled so you can read the code before running it — the
-`enable` step is what puts the widget in your bar.
+Omarchy clones the repository, validates `manifest.json`, and then enables the
+plugin. Review the source before accepting Omarchy's install prompt: plugins
+run unsandboxed with your user permissions.
 
-`rclone` itself is not installed by the plugin (Omarchy's plugin installer
-never runs sudo). The panel offers to install it on first use, or:
-
-```bash
-omarchy pkg add rclone
-```
+`rclone` is an external dependency and is not installed just by adding the
+plugin. If it is missing, choosing **Install rclone** in the panel explicitly
+runs Omarchy's system package flow (`omarchy pkg add rclone`), which may ask
+for your password. You can install it yourself first with the same command.
 
 ## Connecting a service
 
@@ -42,18 +40,26 @@ bookmarked in the Files sidebar, and set to mount again at every login.
 
 ## What it does to your system
 
-Everything is user-level. Nothing here needs root, and nothing is written
-outside your home directory.
+After `rclone` is available, all runtime state is user-level and stays under
+your home directory. The plugin creates or updates only its namespaced files,
+its generated user service, and the bookmark lines for services you connect.
+It refuses to replace a service file that does not carry the plugin's ownership
+marker. Existing rclone remotes not created by this plugin are ignored.
 
 | Path | What |
 |------|------|
 | `~/Cloud/<name>/` | Where each service is mounted |
-| `~/.config/rclone/rclone.conf` | rclone's own config and credentials |
+| `~/.config/rclone/rclone.conf` | rclone credentials for services you explicitly connect |
 | `~/.config/omarchy-cloud/settings.conf` | Mount flags, read by systemd at login |
-| `~/.config/omarchy-cloud/remotes/<name>.conf` | Per-service mount flags |
-| `~/.config/systemd/user/rclone-mount@.service` | The generated mount unit |
-| `~/.config/gtk-3.0/bookmarks` | One sidebar entry per connected service |
-| `~/.cache/rclone/` | The file cache (size-capped, see settings) |
+| `~/.config/omarchy-cloud/remotes/<name>.conf` | Per-service mount flags and plugin ownership record |
+| `~/.config/systemd/user/omarchy-cloud-mount@.service` | Generated systemd user unit |
+| `~/.config/gtk-3.0/bookmarks` | One sidebar line per connected service |
+| `~/.cache/omarchy-cloud/` | Quota responses and the size-capped file cache |
+
+Connecting or disconnecting a service changes rclone's credential file only
+after an explicit action and never deletes provider-side data. Installing the
+`rclone` package is the only system-level operation; it is initiated separately
+through Omarchy's package manager as described above.
 
 ## Things worth knowing
 
@@ -122,25 +128,54 @@ offline reads of cached files.
 
 ## Using it from the terminal
 
-Every layer works on its own, which is also how you debug it.
+Plugin helpers stay inside the installed checkout rather than modifying your
+`PATH`. Every layer works on its own, which is also how you debug it.
 
 ```bash
-omarchy-cloud-connect                     # the setup wizard
-omarchy-cloud-configure gdrive            # per-service settings
-omarchy-cloud-reconnect gdrive            # re-run sign-in
+CLOUD_PLUGIN="$HOME/.config/omarchy/plugins/furmware.cloud"
 
-omarchy-cloud-mount status --with-quota   # what the panel sees, as JSON
-omarchy-cloud-mount enable gdrive         # mount now and at login
-omarchy-cloud-mount stop gdrive           # unmount for this session
-omarchy-cloud-mount run gdrive            # exactly what systemd runs, in the foreground
-omarchy-cloud-mount forget gdrive --yes   # disconnect and delete credentials
+"$CLOUD_PLUGIN/bin/omarchy-cloud-connect"                   # setup wizard
+"$CLOUD_PLUGIN/bin/omarchy-cloud-configure" gdrive          # service settings
+"$CLOUD_PLUGIN/bin/omarchy-cloud-reconnect" gdrive          # re-run sign-in
 
-systemctl --user status rclone-mount@gdrive
-journalctl --user -u rclone-mount@gdrive -f
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" status --with-quota # panel JSON
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" enable gdrive       # now + at login
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" stop gdrive         # this session
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" run gdrive          # foreground mount
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" forget gdrive --yes # delete credentials
+
+systemctl --user status omarchy-cloud-mount@gdrive
+journalctl --user -u omarchy-cloud-mount@gdrive -f
 ```
 
 `forget` deletes local credentials and the bookmark. It never touches
 anything stored in the cloud.
+
+## Remove
+
+If you also want to delete saved provider credentials, disconnect each service
+from its settings screen first. Then run cleanup **before** removing the plugin
+checkout:
+
+```bash
+CLOUD_PLUGIN="$HOME/.config/omarchy/plugins/furmware.cloud"
+"$CLOUD_PLUGIN/bin/omarchy-cloud-uninstall"
+omarchy plugin remove furmware.cloud
+```
+
+Cleanup stops and disables plugin-managed mounts, removes the generated systemd
+user unit, and removes only this plugin's Files bookmarks. It preserves rclone
+remotes and credentials, the `rclone` package, cached files, settings, and all
+provider-side data. To also delete plugin settings and its namespaced cache:
+
+```bash
+"$CLOUD_PLUGIN/bin/omarchy-cloud-uninstall" --purge
+omarchy plugin remove furmware.cloud
+```
+
+Even `--purge` leaves rclone credentials and provider-side data intact. The
+plugin does not remove the shared `rclone` package because other tools may use
+it.
 
 ## Not yet supported
 
@@ -177,8 +212,11 @@ journalctl --user -f | grep -i qml        # QML load errors
 
 ## Requirements
 
-Omarchy 4 (shell plugin system), `rclone`, `fuse3`, `python3`, `gum`. All but
-rclone ship with Omarchy.
+- Omarchy 4 with the Quattro shell plugin system
+- `rclone` (external; installed only on explicit request)
+- `fuse3`, `python3`, and `gum` (included with Omarchy)
+- systemd user services, network access to the selected provider, and a browser
+  for OAuth-based providers
 
 ## License
 
