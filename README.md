@@ -59,9 +59,14 @@ marker. Existing rclone remotes not created by this plugin are ignored.
 | `~/.cache/omarchy-cloud/` | Quota responses and the size-capped file cache |
 
 Connecting or disconnecting a service changes rclone's credential file only
-after an explicit action and never deletes provider-side data. Installing the
-`rclone` package is the only system-level operation; it is initiated separately
-through Omarchy's package manager as described above.
+after an explicit action and never deletes provider-side data. The plugin never
+copies or backs up `rclone.conf`: disconnect asks rclone to remove only the
+selected remote and verifies that it is gone, leaving every unrelated remote
+untouched. On upgrade, obsolete full-config backups created by Cloud 0.2.0 and
+earlier are deleted automatically.
+
+Installing the `rclone` package is the only system-level operation; it is
+initiated separately through Omarchy's package manager as described above.
 
 ## Things worth knowing
 

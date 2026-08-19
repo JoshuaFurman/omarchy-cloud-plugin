@@ -71,22 +71,16 @@ remote_exists() {
   rclone listremotes 2>/dev/null | grep -qx "$1:"
 }
 
-# Keep a rolling set of copies of rclone.conf. Credentials are the only thing
-# in this plugin that cost real effort to recreate.
-backup_config() {
-  local conf backup_dir
-  conf="$HOME/.config/rclone/rclone.conf"
-  backup_dir="$CONFIG_DIR/backups"
-  [[ -s "$conf" ]] || return 0
-
-  mkdir -p "$backup_dir"
-  cp -p "$conf" "$backup_dir/rclone.conf.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || return 0
-  # Keep the ten most recent; these are small and hold live tokens.
-  ls -1t "$backup_dir"/rclone.conf.* 2>/dev/null | tail -n +11 | while read -r old; do
-    rm -f "$old"
-  done
-  chmod 700 "$backup_dir" 2>/dev/null || true
+# Versions through 0.2.0 copied the complete shared rclone.conf before a
+# disconnect. Those copies retained both the disconnected remote's secrets and
+# credentials for unrelated remotes. They have no safe purpose, so remove them
+# on the first invocation after an upgrade and never create them again.
+purge_legacy_credential_backups() {
+  local backup_dir="$CONFIG_DIR/backups"
+  [[ ! -e "$backup_dir" && ! -L "$backup_dir" ]] || rm -rf -- "$backup_dir"
 }
+
+purge_legacy_credential_backups
 
 # ---------------------------------------------------------------- settings
 
@@ -370,15 +364,26 @@ cmd_forget() {
     return 1
   fi
 
-  # rclone.conf holds every service's credentials, and rewriting it is the one
-  # step here that cannot be undone by signing in again to this one service.
-  # A timestamped copy makes an unintended disconnect -- or a rewrite that gets
-  # interrupted partway -- recoverable.
-  backup_config
-
+  # Stop the mount before changing rclone's config, then ask rclone to remove
+  # only this remote's section. Do not copy the shared config: that would retain
+  # this token and every unrelated remote's credentials outside rclone.conf.
+  require_rclone
   cmd_disable "$name"
+  if ! rclone config delete "$name" >/dev/null; then
+    die "could not delete rclone remote '$name'; its credentials may still be saved"
+  fi
+
+  # Do not claim success or remove the ownership record unless the credential
+  # deletion can be verified. Keeping the record lets the user retry safely.
+  local remotes
+  if ! remotes="$(rclone listremotes 2>/dev/null)"; then
+    die "could not verify deletion of rclone remote '$name'; plugin metadata was kept"
+  fi
+  if grep -Fqx "$name:" <<<"$remotes"; then
+    die "rclone remote '$name' still exists; plugin metadata was kept"
+  fi
+
   "$(dirname "$SELF")/omarchy-cloud-bookmark" remove "$MOUNT_ROOT/$name" 2>/dev/null || true
-  rclone config delete "$name" 2>/dev/null || true
   rm -f "$REMOTE_DIR/$name.conf"
   rmdir "$MOUNT_ROOT/$name" 2>/dev/null || true
   echo "Disconnected $name."

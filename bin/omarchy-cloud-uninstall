@@ -3,8 +3,9 @@
 # Remove the user-level integration created by furmware.cloud before the
 # Omarchy plugin checkout itself is deleted.
 #
-# Provider data and rclone credentials are deliberately preserved. Disconnect
-# services from the panel first when those credentials should also be removed.
+# Provider data and live rclone credentials are deliberately preserved.
+# Obsolete full-config backups created by Cloud 0.2.0 and earlier are not:
+# those unnecessary credential copies are always deleted.
 #
 set -euo pipefail
 
@@ -29,7 +30,8 @@ case "${1:-}" in
 Usage: omarchy-cloud-uninstall [--purge]
 
 Stops plugin-managed mounts, removes their generated systemd user unit and
-file-manager bookmarks, and leaves rclone credentials and cloud data intact.
+file-manager bookmarks, and leaves live rclone credentials and cloud data intact.
+Obsolete credential backups created by Cloud 0.2.0 and earlier are removed.
 
 --purge also deletes ~/.config/omarchy-cloud and ~/.cache/omarchy-cloud.
 It still does not delete rclone remotes, provider credentials, cloud data, or
@@ -117,6 +119,10 @@ $current_owned && rm -f "$UNIT_DIR/$UNIT_NAME"
 $legacy_owned && rm -f "$UNIT_DIR/$LEGACY_UNIT_NAME"
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 systemctl --user reset-failed >/dev/null 2>&1 || true
+
+# Old releases copied the complete shared rclone.conf here before disconnects.
+# Never leave those unrelated and supposedly deleted credentials behind.
+rm -rf -- "$CONFIG_DIR/backups"
 
 if $purge; then
   rm -rf "$CONFIG_DIR" "$CACHE_HOME/omarchy-cloud"
