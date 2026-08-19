@@ -1,4 +1,6 @@
-# Cloud
+# Omarchy Cloud Plugin
+
+![Preview](assets/preview.png)
 
 Mount Google Drive, Dropbox, OneDrive and other cloud storage as ordinary
 folders on Omarchy, with connection status in the bar.
@@ -15,7 +17,7 @@ Bar widget  ──▶  systemd user units  ──▶  rclone mount  ──▶  ~
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-rclone-plugin.git
+omarchy plugin add https://github.com/<you>/omarchy-cloud-plugin.git
 omarchy plugin enable furmware.cloud
 ```
 
@@ -158,7 +160,7 @@ error. You can connect it today via **Something else** in the wizard
 Symlink the checkout into the plugin directory so edits apply in place:
 
 ```bash
-ln -sfn ~/Projects/omarchy-rclone-plugin ~/.config/omarchy/plugins/furmware.cloud
+ln -sfn ~/Projects/omarchy-cloud-plugin ~/.config/omarchy/plugins/furmware.cloud
 omarchy-shell shell rescanPlugins
 omarchy plugin enable furmware.cloud
 ```
