@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # Providers the wizard offers by name. Anything else still works -- it just
@@ -44,6 +45,12 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "om
 STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-cloud"
 UNIT_PREFIXES = ("omarchy-cloud-mount@", "rclone-mount@")
 REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+ICLOUD_STORAGE_URL = "https://setup.icloud.com/setup/ws/1/storageUsageInfo"
+ICLOUD_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/18.3.1 Safari/605.1.15"
+)
 
 
 def run(command, timeout=5):
@@ -104,6 +111,9 @@ def read_remotes(path, managed_names):
         if name not in managed_names:
             continue
         backend = parser[name].get("type", "")
+        # Most browser-authenticated providers store `token`; iCloud's SRP/2FA
+        # flow stores a trust token instead.
+        auth_key = "trust_token" if backend == "iclouddrive" else "token"
         remotes.append(
             {
                 "name": name,
@@ -113,7 +123,7 @@ def read_remotes(path, managed_names):
                 # back to what the user called it, which beats showing them the
                 # rclone backend id.
                 "label": PROVIDER_LABELS.get(backend, name),
-                "hasToken": bool(parser[name].get("token")),
+                "hasAuth": bool(parser[name].get(auth_key)),
             }
         )
 
@@ -224,19 +234,61 @@ def last_failure(name):
     return out.splitlines()[-1][:200] if out.splitlines() else ""
 
 
-def quota(name, max_age):
-    """Used/total bytes, cached on disk. Returns (used, total, known)."""
+def icloud_quota(name, rclone_config):
+    """Fetch account-wide iCloud storage using rclone's authenticated cookies."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(rclone_config, encoding="utf-8")
+        if parser[name].get("type") != "iclouddrive":
+            return 0, 0, False
+        cookies = parser[name].get("cookies", "")
+    except (KeyError, OSError, configparser.Error):
+        return 0, 0, False
+    if not cookies:
+        return 0, 0, False
+
+    # rclone's iCloud backend does not implement `about`, even though Apple's
+    # web API exposes account-wide quota. Reuse the session it authenticated;
+    # the cookie stays in memory and is never put on a command line or in JSON.
+    request = urllib.request.Request(
+        ICLOUD_STORAGE_URL,
+        headers={
+            "Accept": "application/json",
+            "Cookie": cookies,
+            "Origin": "https://www.icloud.com",
+            "Referer": "https://www.icloud.com/",
+            "User-Agent": ICLOUD_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+        usage = data.get("storageUsageInfo", {})
+        used = int(usage.get("usedStorageInBytes", 0) or 0)
+        total = int(usage.get("totalStorageInBytes", 0) or 0)
+        return used, total, total > 0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0, 0, False
+
+
+def quota(name, backend, max_age, rclone_config, refresh):
+    """Return cached quota, refreshing it from the provider when requested."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = CACHE_DIR / f"quota-{name}.json"
 
     if cache_file.exists():
         try:
             age = time.time() - cache_file.stat().st_mtime
-            if age < max_age:
+            if not refresh or age < max_age:
                 cached = json.loads(cache_file.read_text(encoding="utf-8"))
                 return cached.get("used", 0), cached.get("total", 0), cached.get("known", False)
         except (OSError, ValueError):
             pass
+
+    # Fast status polls keep displaying the last quota but never make network
+    # requests. Only the separate, slow quota timer is allowed to refresh it.
+    if not refresh:
+        return 0, 0, False
 
     code, out = run(["rclone", "about", f"{name}:", "--json"], timeout=25)
     used, total, known = 0, 0, False
@@ -248,6 +300,8 @@ def quota(name, max_age):
             known = total > 0
         except (ValueError, TypeError):
             pass
+    if not known and backend == "iclouddrive":
+        used, total, known = icloud_quota(name, rclone_config)
 
     try:
         cache_file.write_text(
@@ -260,7 +314,10 @@ def quota(name, max_age):
 
 def classify(remote, mounted, unit):
     """Collapse unit + mount + config into the one word the panel shows."""
-    if not remote["hasToken"] and remote["type"] in ("drive", "dropbox", "onedrive", "box", "pcloud", "iclouddrive"):
+    authenticated_types = (
+        "drive", "dropbox", "onedrive", "box", "pcloud", "iclouddrive"
+    )
+    if not remote["hasAuth"] and remote["type"] in authenticated_types:
         return "needs-auth"
     if mounted and unit["active"] == "active":
         return "mounted"
@@ -305,7 +362,8 @@ def main():
         first = version_out.splitlines()[0].split()
         version = first[1] if len(first) > 1 else ""
 
-    remotes = read_remotes(config_path(), managed_remote_names())
+    rclone_config = config_path()
+    remotes = read_remotes(rclone_config, managed_remote_names())
     live = mounted_paths()
     states = unit_states([r["name"] for r in remotes])
 
@@ -338,8 +396,14 @@ def main():
         if state == "failed":
             row["detail"] = last_failure(name)
 
-        if args.with_quota and state == "mounted":
-            used, total, known = quota(name, args.quota_age)
+        if state == "mounted":
+            used, total, known = quota(
+                name,
+                remote["type"],
+                args.quota_age,
+                rclone_config,
+                refresh=args.with_quota,
+            )
             row["usedBytes"] = used
             row["totalBytes"] = total
             row["quotaKnown"] = known

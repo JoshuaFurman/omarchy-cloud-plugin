@@ -20,6 +20,8 @@ BOOKMARK="$BIN_DIR/omarchy-cloud-bookmark"
 
 # shellcheck source=omarchy-cloud-ui.sh
 source "$BIN_DIR/omarchy-cloud-ui.sh"
+# shellcheck source=omarchy-cloud-rclone-config.sh
+source "$BIN_DIR/omarchy-cloud-rclone-config.sh"
 trap hold_open EXIT
 
 abort() {
@@ -138,12 +140,16 @@ has_token() {
 
 # Backends that use OAuth prove themselves with a token. Everything else
 # (sftp, alias, s3 …) has no token to check, so fall back to actually reaching
-# the remote.
-needs_oauth() {
+# the remote. iCloud uses Apple's SRP/2FA flow and stores a trust token instead.
+uses_oauth() {
   case "$1" in
-    drive|dropbox|onedrive|box|pcloud|yandex|jottacloud|iclouddrive) return 0 ;;
+    drive|dropbox|onedrive|box|pcloud|yandex|jottacloud) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+has_trust_token() {
+  rclone config show "$1" 2>/dev/null | grep -qE '^trust_token = .+'
 }
 
 remote_works() {
@@ -151,19 +157,49 @@ remote_works() {
 }
 
 connected() {
-  if needs_oauth "$PROVIDER_TYPE"; then has_token "$1"
-  else remote_works "$1"
-  fi
+  case "$PROVIDER_TYPE" in
+    iclouddrive) has_trust_token "$1" ;;
+    *)
+      if uses_oauth "$PROVIDER_TYPE"; then has_token "$1"
+      else remote_works "$1"
+      fi
+      ;;
+  esac
 }
 
 CLIENT_ID=""
 CLIENT_SECRET=""
+APPLE_ID=""
+APPLE_PASSWORD_OBSCURED=""
 
 # Google is retiring the credentials rclone ships with, so this is a real
 # decision rather than an advanced option, and it belongs in our own words --
 # rclone raises it mid-flow as a bare y/n whose default is "no", which aborts
 # the sign-in for anyone who just presses enter.
 choose_credentials() {
+  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    heading "Apple credentials"
+    echo "iCloud uses your regular Apple Account password followed by 2FA."
+    echo "App-specific passwords are not accepted. Your password is obscured"
+    echo "before it is saved in rclone's configuration."
+    echo
+
+    APPLE_ID="$(gum input --placeholder "Apple ID")" || abort "Cancelled."
+    local apple_password
+    apple_password="$(gum input --password \
+      --placeholder "Apple Account password")" || abort "Cancelled."
+    if [[ -z "$APPLE_ID" || -z "$apple_password" ]]; then
+      abort "Both the Apple ID and password are required."
+    fi
+
+    # Feed the password over stdin so the clear text never appears in the
+    # process list. rclone config create receives only its obscured form.
+    APPLE_PASSWORD_OBSCURED="$(rclone obscure - <<<"$apple_password")" ||
+      abort "Could not obscure the Apple password."
+    unset apple_password
+    return 0
+  fi
+
   [[ "$PROVIDER_TYPE" == "drive" ]] || return 0
 
   heading "Google credentials"
@@ -207,26 +243,47 @@ create_remote() {
   [[ "$PROVIDER_TYPE" == "drive" ]] && create_args+=(scope=drive)
   [[ -n "$CLIENT_ID" ]] && create_args+=("client_id=$CLIENT_ID")
   [[ -n "$CLIENT_SECRET" ]] && create_args+=("client_secret=$CLIENT_SECRET")
+  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    create_args+=("service=drive" "apple_id=$APPLE_ID" "password=$APPLE_PASSWORD_OBSCURED")
+  fi
 
-  # Said before rclone starts, because rclone opens the browser itself the
-  # moment it gets there. Printing this afterwards describes something that has
-  # already happened.
-  if needs_oauth "$PROVIDER_TYPE"; then
+  # Said before rclone starts, because OAuth backends open the browser the
+  # moment they get there. Printing this afterwards describes something that
+  # has already happened.
+  if uses_oauth "$PROVIDER_TYPE"; then
     echo "A browser window will open so you can sign in to $PROVIDER_LABEL."
     echo "Approve access, then come back here."
-    [[ -z "$CLIENT_ID" ]] &&
+    [[ "$PROVIDER_TYPE" == "drive" && -z "$CLIENT_ID" ]] &&
       warn "First, rclone asks whether to use its shared credentials — answer y."
+    echo
+  elif [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    echo "Apple will send a verification prompt to a trusted device."
+    echo "Enter the 2FA code here when rclone asks for it."
     echo
   fi
 
-  # --no-output stops rclone echoing the finished config, which includes the
-  # OAuth token, into a terminal window sitting on the user's screen.
-  # Interactive prompts are unaffected, so nothing is hidden that has to be
-  # answered.
-  if ! rclone "${create_args[@]}" --no-output; then
-    abort "rclone could not create the remote. Try 'rclone config' by hand."
-  fi
+  # A failed provider login can still leave a partial rclone entry behind.
   CREATED_REMOTE="$REMOTE_NAME"
+  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    # The password is already obscured. The state driver captures rclone's JSON
+    # responses so neither auth state nor credentials are printed.
+    if run_icloud_config "$REMOTE_NAME" "${create_args[@]}" --no-obscure; then
+      :
+    else
+      local config_status=$?
+      cleanup_partial
+      CREATED_REMOTE=""
+      ((config_status == 130)) && abort "Cancelled."
+      abort "rclone could not create the remote. Try 'rclone config' by hand."
+    fi
+  else
+    # Keep the finished config (including its OAuth token) off the terminal.
+    if ! rclone "${create_args[@]}" --no-output; then
+      cleanup_partial
+      CREATED_REMOTE=""
+      abort "rclone could not create the remote. Try 'rclone config' by hand."
+    fi
+  fi
 
   if connected "$REMOTE_NAME"; then
     good "Connected."
@@ -240,10 +297,16 @@ create_remote() {
   echo
   gum confirm --default=false "Try signing in again?" || { cleanup_partial; abort "Cancelled."; }
 
-  # `config update` re-runs the OAuth flow exactly as `config reconnect` does,
-  # but accepts --no-output; reconnect rejects the flag and would echo the new
-  # token to the screen.
-  if ! rclone config update "$REMOTE_NAME" --no-output || ! connected "$REMOTE_NAME"; then
+  # `config update` re-runs authentication exactly as `config reconnect` does.
+  # iCloud needs the same explicit state driver for its new 2FA code; OAuth
+  # providers can keep their completed config (including the token) hidden.
+  local retry_ok=false
+  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    run_icloud_config "$REMOTE_NAME" config update "$REMOTE_NAME" && retry_ok=true
+  else
+    rclone config update "$REMOTE_NAME" --no-output && retry_ok=true
+  fi
+  if [[ "$retry_ok" != "true" ]] || ! connected "$REMOTE_NAME"; then
     cleanup_partial
     abort "Sign-in did not complete. Nothing was saved."
   fi

@@ -32,11 +32,13 @@ for your password. You can install it yourself first with the same command.
 ## Connecting a service
 
 Click the cloud icon in the bar, then **Connect a service…**. A terminal opens
-and asks three questions: which provider, what to call the folder, and — for
-Google Drive — whether to show Google Docs as Office files.
+and asks which provider to use, what to call the folder, and any credentials or
+provider-specific choices it needs.
 
-Signing in happens in your browser. When it finishes, the folder is mounted,
-bookmarked in the Files sidebar, and set to mount again at every login.
+OAuth services sign in through your browser. iCloud uses your regular Apple
+Account password and then asks for a 2FA code in the terminal. When sign-in
+finishes, the folder is mounted, bookmarked in the Files sidebar, and set to
+mount again at every login.
 
 ## What it does to your system
 
@@ -177,15 +179,17 @@ Even `--purge` leaves rclone credentials and provider-side data intact. The
 plugin does not remove the shared `rclone` package because other tools may use
 it.
 
-## Not yet supported
+## Experimental support
 
-**iCloud Drive.** rclone's iCloud backend exists but is classified
-experimental: its trust token expires every 30 days and needs re-authenticating
-by hand, app-specific passwords are rejected, and there are open upstream bugs
-in the 2FA flow. Support is planned once the plugin can handle scheduled
-re-authentication properly rather than presenting a monthly breakage as an
-error. You can connect it today via **Something else** in the wizard
-(backend name `iclouddrive`), with those caveats.
+**iCloud Drive.** Connect it via **Something else** in the wizard (backend name
+`iclouddrive`). It requires your regular Apple Account password; app-specific
+passwords are rejected. rclone classifies this backend as experimental, and its
+trust token expires every 30 days. Until the plugin can schedule that renewal,
+reauthenticate manually with `omarchy-cloud-reconnect` as shown above.
+
+rclone does not expose iCloud's storage quota, so the panel's slow usage refresh
+calls Apple's storage endpoint with the session cookie rclone already saved.
+That cookie stays in memory and is never printed or passed on a command line.
 
 **Offline sync.** Only cached files work offline. A true offline folder needs
 `rclone bisync` and a conflict-resolution story.

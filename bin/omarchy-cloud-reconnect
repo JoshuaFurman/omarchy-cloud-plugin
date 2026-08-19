@@ -9,19 +9,38 @@ BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 MOUNT="$BIN_DIR/omarchy-cloud-mount"
 # shellcheck source=omarchy-cloud-ui.sh
 source "$BIN_DIR/omarchy-cloud-ui.sh"
+# shellcheck source=omarchy-cloud-rclone-config.sh
+source "$BIN_DIR/omarchy-cloud-rclone-config.sh"
 trap hold_open EXIT
 
 name="${1:?usage: omarchy-cloud-reconnect <service>}"
+remote_type="$(rclone config show "$name" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
+[[ -n "$remote_type" ]] || { bad "No connected service called '$name'."; exit 1; }
 
 title "Sign in to $name"
-echo "A browser window will open. Approve access, then come back here."
+if [[ "$remote_type" == "iclouddrive" ]]; then
+  echo "Apple will send a verification prompt to a trusted device."
+  echo "Enter the 2FA code here when rclone asks for it."
+else
+  echo "A browser window will open. Approve access, then come back here."
+fi
 echo
 
-# --no-output keeps the refreshed token off the screen; `config reconnect`
-# runs the same flow but rejects the flag.
-if rclone config update "$name" --no-output; then
+# --no-output keeps refreshed OAuth tokens off the screen. iCloud needs its
+# JSON state protocol driven explicitly or rclone submits a blank 2FA code.
+status=0
+if [[ "$remote_type" == "iclouddrive" ]]; then
+  run_icloud_config "$name" config update "$name" || status=$?
+else
+  rclone config update "$name" --no-output || status=$?
+fi
+
+if ((status == 0)); then
   good "Signed in."
   "$MOUNT" restart "$name" 2>/dev/null || true
+elif ((status == 130)); then
+  bad "Cancelled."
+  exit 130
 else
   bad "Sign-in did not complete."
   exit 1
