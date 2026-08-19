@@ -1,0 +1,170 @@
+#!/bin/bash
+#
+# Settings for one already-connected service.
+#
+# Everything here is changeable after setup -- the choices made during the
+# wizard are defaults, not commitments. Applying a change rewrites the
+# per-remote flags and restarts that one mount; nothing else is touched.
+#
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-cloud"
+REMOTE_DIR="$CONFIG_DIR/remotes"
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+MOUNT="$BIN_DIR/omarchy-cloud-mount"
+
+# shellcheck source=omarchy-cloud-ui.sh
+source "$BIN_DIR/omarchy-cloud-ui.sh"
+trap hold_open EXIT
+
+REMOTE_NAME="${1:-}"
+[[ -n "$REMOTE_NAME" ]] || { bad "usage: omarchy-cloud-configure <service>"; exit 1; }
+
+REMOTE_TYPE="$(rclone config show "$REMOTE_NAME" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
+[[ -n "$REMOTE_TYPE" ]] || { bad "No connected service called '$REMOTE_NAME'."; exit 1; }
+
+label="$REMOTE_NAME"
+extra_flags=""
+# shellcheck source=/dev/null
+[[ -f "$REMOTE_DIR/$REMOTE_NAME.conf" ]] && source "$REMOTE_DIR/$REMOTE_NAME.conf"
+
+save() {
+  mkdir -p "$REMOTE_DIR"
+  cat >"$REMOTE_DIR/$REMOTE_NAME.conf" <<EOF
+# Written by omarchy-cloud-configure for the '$REMOTE_NAME' remote.
+# extra_flags is appended to the rclone mount command line.
+label="$label"
+extra_flags="$extra_flags"
+EOF
+}
+
+# Mount flags are read at start, so a change only takes effect on a restart.
+remount() {
+  if systemctl --user is-active --quiet "rclone-mount@$REMOTE_NAME.service"; then
+    say "Restarting the mount so the change takes effect…"
+    systemctl --user restart "rclone-mount@$REMOTE_NAME.service"
+  fi
+}
+
+# ---------------------------------------------------------------- google docs
+
+# Kept in step with the same question in omarchy-cloud-connect.
+gdocs_current() {
+  case "$extra_flags" in
+    *skip-gdocs*)                 echo "Hidden" ;;
+    *"link.html"*)                echo "Open in Google Docs" ;;
+    *export-formats*)             echo "Converted to Office files" ;;
+    *)                            echo "Default" ;;
+  esac
+}
+
+configure_gdocs() {
+  heading "Google Docs, Sheets and Slides"
+  echo "Currently: $(gdocs_current)"
+  echo
+  echo "Drive only stores these online, so their size is unknown until they're"
+  echo "converted. That is why converting them often produces a 0-byte file."
+  echo
+
+  local choice
+  choice="$(printf '%s\n' \
+    "Open them in Google Docs (recommended)" \
+    "Convert to Office files" \
+    "Hide them" |
+    gum choose --header "")" || return 0
+
+  # Replace only the gdocs-related flags, preserving anything else set here.
+  local kept
+  kept="$(sed -E 's/--drive-export-formats [^ ]+//g; s/--drive-skip-gdocs//g' <<<"$extra_flags" |
+    tr -s ' ' | sed 's/^ *//; s/ *$//')"
+
+  case "$choice" in
+    Hide*)    extra_flags="$kept --drive-skip-gdocs" ;;
+    Convert*)
+      warn "Note: these often show as 0 bytes and fail to open through a mount."
+      extra_flags="$kept --drive-export-formats docx,xlsx,pptx"
+      ;;
+    *)        extra_flags="$kept --drive-export-formats link.html" ;;
+  esac
+  extra_flags="$(sed 's/^ *//; s/ *$//' <<<"$extra_flags")"
+
+  save
+  remount
+  good "Saved."
+}
+
+# ---------------------------------------------------------------- other bits
+
+configure_autostart() {
+  local now="off"
+  systemctl --user is-enabled --quiet "rclone-mount@$REMOTE_NAME.service" 2>/dev/null && now="on"
+
+  heading "Mount at login"
+  echo "Currently: $now"
+  echo
+
+  if [[ "$now" == "on" ]]; then
+    if gum confirm "Stop mounting this at login?"; then
+      systemctl --user disable "rclone-mount@$REMOTE_NAME.service" >/dev/null 2>&1
+      good "It will no longer mount at login."
+    fi
+  else
+    if gum confirm "Mount this automatically at login?"; then
+      "$MOUNT" enable "$REMOTE_NAME" && good "It will mount at login."
+    fi
+  fi
+}
+
+configure_flags() {
+  heading "Extra rclone flags"
+  echo "Appended to the mount command. Leave empty for none."
+  echo "Reference: https://rclone.org/${REMOTE_TYPE}/"
+  echo
+
+  local entered
+  entered="$(gum input --value "$extra_flags" --width 70 --placeholder "--flag value")" || return 0
+  extra_flags="$entered"
+  save
+  remount
+  good "Saved."
+}
+
+disconnect_service() {
+  heading "Disconnect $label"
+  echo "This unmounts it, deletes the saved sign-in, and removes its bookmark."
+  echo "Nothing stored in the cloud is deleted."
+  echo
+
+  gum confirm "Disconnect $label?" || return 0
+  "$MOUNT" forget "$REMOTE_NAME" --yes
+  good "Disconnected."
+  exit 0
+}
+
+# ---------------------------------------------------------------- menu
+
+main() {
+  while true; do
+    title "$label settings"
+
+    local -a options=()
+    [[ "$REMOTE_TYPE" == "drive" ]] && options+=("Google Docs handling — $(gdocs_current)")
+    options+=("Mount at login")
+    options+=("Extra rclone flags")
+    options+=("Disconnect this service")
+    options+=("Close")
+
+    local choice
+    choice="$(printf '%s\n' "${options[@]}" | gum choose --header "")" || exit 0
+
+    case "$choice" in
+      "Google Docs handling"*)   configure_gdocs ;;
+      "Mount at login")          configure_autostart ;;
+      "Extra rclone flags")      configure_flags ;;
+      "Disconnect this service") disconnect_service ;;
+      *)                         exit 0 ;;
+    esac
+  done
+}
+
+main "$@"

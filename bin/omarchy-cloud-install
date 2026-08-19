@@ -1,0 +1,23 @@
+#!/bin/bash
+#
+# Install rclone. Kept separate from the wizard so the panel can offer it on
+# its own when rclone is missing entirely.
+#
+set -uo pipefail
+
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+# shellcheck source=omarchy-cloud-ui.sh
+source "$BIN_DIR/omarchy-cloud-ui.sh"
+trap hold_open EXIT
+
+title "Install rclone"
+echo "The Cloud plugin uses rclone to talk to cloud providers."
+echo "You'll be asked for your password to install it."
+echo
+
+if omarchy pkg add rclone; then
+  good "rclone installed."
+else
+  bad "Installation failed."
+  exit 1
+fi

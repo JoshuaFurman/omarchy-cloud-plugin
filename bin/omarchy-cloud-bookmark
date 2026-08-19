@@ -1,0 +1,78 @@
+#!/bin/bash
+#
+# Nautilus sidebar entries for mounted cloud folders.
+#
+# GTK reads ~/.config/gtk-3.0/bookmarks live, so adding a line here makes the
+# folder appear in the sidebar immediately -- no restart, no gvfs involvement.
+# Bookmarks track whether a service is *connected*, not whether it happens to
+# be mounted right now: a bookmark that disappears every time you unmount is
+# worse than one that occasionally points at an empty folder.
+#
+set -euo pipefail
+
+BOOKMARKS="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookmarks"
+
+# GTK bookmark URIs are percent-encoded. Paths we generate are restricted to
+# safe remote names, but the mount root is user-supplied and can contain
+# spaces, so encode anything that is not an unreserved character or a slash.
+encode_uri() {
+  local input="$1" out="" i char
+  for ((i = 0; i < ${#input}; i++)); do
+    char="${input:i:1}"
+    case "$char" in
+      [A-Za-z0-9._~/-]) out+="$char" ;;
+      *) out+="$(printf '%%%02X' "'$char")" ;;
+    esac
+  done
+  printf 'file://%s' "$out"
+}
+
+ensure_file() {
+  mkdir -p "$(dirname "$BOOKMARKS")"
+  [[ -f "$BOOKMARKS" ]] || : >"$BOOKMARKS"
+}
+
+# Drop every line whose URI is `uri`. A bookmark line is "URI[ label]", so
+# comparing the first whitespace-separated field as a plain string is both
+# exact and free of the regex-escaping problems a grep pattern would have --
+# the URI contains slashes and percent signs, and the mount root is
+# user-supplied.
+strip_uri() {
+  local uri="$1" file="$2"
+  awk -v uri="$uri" '$1 != uri' "$file"
+}
+
+cmd_add() {
+  local path="${1:?usage: omarchy-cloud-bookmark add <path> [label]}"
+  local label="${2:-$(basename "$path")}"
+  local uri tmp
+  uri="$(encode_uri "$path")"
+
+  ensure_file
+  tmp="$(mktemp)"
+  # Idempotent: a re-add replaces the existing entry so a renamed service
+  # updates its label instead of gaining a second sidebar row.
+  strip_uri "$uri" "$BOOKMARKS" >"$tmp"
+  printf '%s %s\n' "$uri" "$label" >>"$tmp"
+  mv "$tmp" "$BOOKMARKS"
+}
+
+cmd_remove() {
+  local path="${1:?usage: omarchy-cloud-bookmark remove <path>}"
+  local uri tmp
+  uri="$(encode_uri "$path")"
+
+  [[ -f "$BOOKMARKS" ]] || return 0
+  tmp="$(mktemp)"
+  strip_uri "$uri" "$BOOKMARKS" >"$tmp"
+  mv "$tmp" "$BOOKMARKS"
+}
+
+case "${1:-}" in
+  add)    shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  *)
+    echo "Usage: omarchy-cloud-bookmark add <path> [label] | remove <path>" >&2
+    exit 1
+    ;;
+esac

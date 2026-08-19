@@ -1,0 +1,25 @@
+#!/bin/bash
+#
+# Re-run a service's sign-in. Providers expire credentials on their own
+# schedule, so this is routine maintenance rather than error recovery.
+#
+set -uo pipefail
+
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+# shellcheck source=omarchy-cloud-ui.sh
+source "$BIN_DIR/omarchy-cloud-ui.sh"
+trap hold_open EXIT
+
+name="${1:?usage: omarchy-cloud-reconnect <service>}"
+
+title "Sign in to $name"
+echo "A browser window will open. Approve access, then come back here."
+echo
+
+if rclone config reconnect "$name:"; then
+  good "Signed in."
+  systemctl --user restart "rclone-mount@$name.service" 2>/dev/null || true
+else
+  bad "Sign-in did not complete."
+  exit 1
+fi

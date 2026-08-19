@@ -1,0 +1,296 @@
+#!/bin/bash
+#
+# Guided setup for a new cloud service.
+#
+# Runs in a floating terminal launched from the plugin panel. rclone's own
+# `rclone config` is a nested TUI that asks about advanced settings most people
+# have no opinion on; this asks the three questions that matter and infers the
+# rest.
+#
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-cloud"
+REMOTE_DIR="$CONFIG_DIR/remotes"
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+MOUNT="$BIN_DIR/omarchy-cloud-mount"
+BOOKMARK="$BIN_DIR/omarchy-cloud-bookmark"
+
+# ---------------------------------------------------------------- output
+
+# shellcheck source=omarchy-cloud-ui.sh
+source "$BIN_DIR/omarchy-cloud-ui.sh"
+trap hold_open EXIT
+
+abort() {
+  echo
+  bad "$*"
+  exit 1
+}
+
+# The wizard can fail partway through -- after the remote exists but before it
+# authenticates, say. Leaving a half-configured remote behind means the panel
+# shows a service that has never worked, so undo it unless it got far enough
+# to be useful.
+CREATED_REMOTE=""
+cleanup_partial() {
+  [[ -n "$CREATED_REMOTE" ]] || return 0
+  warn "Removing the half-configured '$CREATED_REMOTE' remote."
+  rclone config delete "$CREATED_REMOTE" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- rclone
+
+ensure_rclone() {
+  command -v rclone >/dev/null 2>&1 && return 0
+
+  heading "rclone is not installed"
+  echo "This plugin uses rclone to talk to cloud providers."
+  echo
+  gum confirm "Install it now with pacman?" || abort "Cannot continue without rclone."
+
+  omarchy pkg add rclone || abort "Installing rclone failed."
+  command -v rclone >/dev/null 2>&1 || abort "rclone still isn't on PATH."
+  good "rclone installed."
+}
+
+# ---------------------------------------------------------------- provider
+
+PROVIDER_LABEL=""
+PROVIDER_TYPE=""
+PROVIDER_DEFAULT_NAME=""
+
+choose_provider() {
+  heading "Which service do you want to connect?"
+
+  local choice
+  choice="$(printf '%s\n' \
+    "Google Drive" \
+    "Dropbox" \
+    "OneDrive" \
+    "Something else (any rclone backend)" |
+    gum choose --header "")" || abort "Cancelled."
+
+  case "$choice" in
+    "Google Drive") PROVIDER_LABEL="Google Drive"; PROVIDER_TYPE="drive";    PROVIDER_DEFAULT_NAME="gdrive" ;;
+    "Dropbox")      PROVIDER_LABEL="Dropbox";      PROVIDER_TYPE="dropbox";  PROVIDER_DEFAULT_NAME="dropbox" ;;
+    "OneDrive")     PROVIDER_LABEL="OneDrive";     PROVIDER_TYPE="onedrive"; PROVIDER_DEFAULT_NAME="onedrive" ;;
+    *)
+      heading "Any rclone backend"
+      echo "Enter the rclone backend name, for example: pcloud, box, s3, sftp."
+      echo "Full list: https://rclone.org/overview/"
+      echo
+      PROVIDER_TYPE="$(gum input --placeholder "backend name")" || abort "Cancelled."
+      [[ -n "$PROVIDER_TYPE" ]] || abort "No backend given."
+      PROVIDER_LABEL="$PROVIDER_TYPE"
+      PROVIDER_DEFAULT_NAME="$PROVIDER_TYPE"
+      warn "Backends outside the tested three may ask questions this wizard cannot answer."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- naming
+
+REMOTE_NAME=""
+
+choose_name() {
+  heading "What should this folder be called?"
+  echo "It becomes the folder name under your mount folder, so keep it short."
+  echo
+
+  local suggestion="$PROVIDER_DEFAULT_NAME"
+  local existing
+  existing="$(rclone listremotes 2>/dev/null | tr -d ':')"
+
+  # Don't suggest a name that is already taken.
+  if grep -qx "$suggestion" <<<"$existing"; then
+    local n=2
+    while grep -qx "$suggestion$n" <<<"$existing"; do n=$((n + 1)); done
+    suggestion="$suggestion$n"
+  fi
+
+  while true; do
+    REMOTE_NAME="$(gum input --value "$suggestion" --placeholder "folder name")" ||
+      abort "Cancelled."
+
+    if [[ ! "$REMOTE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+      bad "Use letters, numbers, dashes and underscores; start with a letter or number."
+      continue
+    fi
+    if grep -qx "$REMOTE_NAME" <<<"$existing"; then
+      bad "'$REMOTE_NAME' is already connected. Pick another name."
+      continue
+    fi
+    break
+  done
+}
+
+# ---------------------------------------------------------------- auth
+
+# The real test of whether a remote works. `rclone config create` takes the
+# default answer to every question it would otherwise ask, and for OAuth
+# backends that does not reliably run the browser flow -- so asking rclone
+# whether a token exists is not enough. Listing the root is.
+remote_works() {
+  rclone lsd "$1:" --max-depth 1 --retries 1 --low-level-retries 1 --timeout 20s \
+    >/dev/null 2>&1
+}
+
+create_remote() {
+  heading "Connecting $PROVIDER_LABEL"
+
+  local -a create_args=(config create "$REMOTE_NAME" "$PROVIDER_TYPE")
+  # Ask for the whole drive rather than rclone's narrower default, so files
+  # created outside rclone are visible too.
+  [[ "$PROVIDER_TYPE" == "drive" ]] && create_args+=(scope=drive)
+
+  if ! rclone "${create_args[@]}" >/dev/null 2>&1; then
+    abort "rclone could not create the remote. Try 'rclone config' by hand."
+  fi
+  CREATED_REMOTE="$REMOTE_NAME"
+
+  if remote_works "$REMOTE_NAME"; then
+    good "Connected."
+    return 0
+  fi
+
+  # Expected for OAuth providers: the remote exists but has no token yet.
+  echo "A browser window will open so you can sign in to $PROVIDER_LABEL."
+  echo "Come back here once you've approved access."
+  echo
+  gum confirm "Open the browser now?" || { cleanup_partial; abort "Cancelled."; }
+
+  if ! rclone config reconnect "$REMOTE_NAME:"; then
+    cleanup_partial
+    abort "Sign-in did not complete."
+  fi
+
+  if ! remote_works "$REMOTE_NAME"; then
+    cleanup_partial
+    abort "Signed in, but $PROVIDER_LABEL still isn't reachable. Check 'rclone config'."
+  fi
+
+  good "Connected."
+}
+
+# ---------------------------------------------------------------- options
+
+EXTRA_FLAGS=""
+
+provider_options() {
+  [[ "$PROVIDER_TYPE" == "drive" ]] || return 0
+
+  heading "Google Docs, Sheets and Slides"
+  echo "These aren't real files -- Drive only stores them online, so their size"
+  echo "is unknown until they're converted."
+  echo
+  EXTRA_FLAGS="$(choose_gdocs_mode)"
+}
+
+# Shared with omarchy-cloud-configure so the wizard and the settings screen
+# cannot drift on wording or on which flags each choice maps to.
+choose_gdocs_mode() {
+  local choice
+  choice="$(printf '%s\n' \
+    "Open them in Google Docs (recommended)" \
+    "Convert to Office files" \
+    "Hide them" |
+    gum choose --header "")" || choice="Open them in Google Docs (recommended)"
+
+  case "$choice" in
+    Hide*)
+      echo "--drive-skip-gdocs"
+      ;;
+    Convert*)
+      # rclone's own docs are explicit that this often does not work through a
+      # mount: the size of an exported doc is unknown until it is generated, so
+      # the VFS reports 0 bytes and most applications refuse to open the file.
+      # Offered because it does work for some tools, but never as the default.
+      warn "Heads up: converted files often show as 0 bytes and fail to open." >&2
+      warn "Google's own size limits make this unreliable through a mount." >&2
+      echo "--drive-export-formats docx,xlsx,pptx"
+      ;;
+    *)
+      # A tiny HTML file that redirects to the document's Drive URL. It has a
+      # real size, so it opens reliably -- straight into Google Docs, Sheets or
+      # Slides in the browser, where the file is editable.
+      echo "--drive-export-formats link.html"
+      ;;
+  esac
+}
+
+save_remote_config() {
+  mkdir -p "$REMOTE_DIR"
+  cat >"$REMOTE_DIR/$REMOTE_NAME.conf" <<EOF
+# Written by omarchy-cloud-connect for the '$REMOTE_NAME' remote.
+# extra_flags is appended to the rclone mount command line.
+label="$PROVIDER_LABEL"
+extra_flags="$EXTRA_FLAGS"
+EOF
+}
+
+# ---------------------------------------------------------------- mount
+
+mount_root() {
+  local root="$HOME/Cloud"
+  # shellcheck source=/dev/null
+  [[ -f "$CONFIG_DIR/settings.conf" ]] && source "$CONFIG_DIR/settings.conf"
+  echo "${MOUNT_ROOT:-$root}" | sed "s|^~|$HOME|"
+}
+
+mount_it() {
+  heading "Mounting"
+
+  local root mount_point
+  root="$(mount_root)"
+  mount_point="$root/$REMOTE_NAME"
+
+  "$MOUNT" install-unit >/dev/null || abort "Could not install the systemd unit."
+
+  if ! "$MOUNT" enable "$REMOTE_NAME"; then
+    abort "systemd could not start the mount. See: journalctl --user -u rclone-mount@$REMOTE_NAME"
+  fi
+
+  # `systemctl enable --now` returns as soon as the unit is active, and with
+  # Type=notify that already means the mountpoint is live. Confirm anyway --
+  # a bookmark pointing at nothing is the one outcome worth preventing.
+  local waited=0
+  while ! mountpoint -q "$mount_point" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if ((waited >= 20)); then
+      warn "The mount hasn't appeared yet. It may still be starting."
+      warn "Check with: systemctl --user status rclone-mount@$REMOTE_NAME"
+      return 0
+    fi
+  done
+
+  "$BOOKMARK" add "$mount_point" "$PROVIDER_LABEL" 2>/dev/null || true
+  good "Mounted at $mount_point"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  title "Connect a cloud service"
+
+  ensure_rclone
+  choose_provider
+  choose_name
+  create_remote
+  provider_options
+  save_remote_config
+  # Past this point the remote is real and worth keeping even if mounting
+  # fails, so stop offering to tear it down.
+  CREATED_REMOTE=""
+  mount_it
+
+  echo
+  good "$PROVIDER_LABEL is ready."
+  echo "Open it from the Cloud panel in your bar, or find it in the Files sidebar."
+  echo
+  warn "One thing worth knowing: deleting a file here skips the desktop trash."
+  warn "$PROVIDER_LABEL keeps its own trash, so files are usually recoverable there."
+}
+
+main "$@"

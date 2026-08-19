@@ -1,0 +1,38 @@
+#!/bin/bash
+#
+# Open one of the plugin's interactive scripts in a floating terminal.
+#
+# Split out from the panel so the window handling lives in one place, and so
+# the scripts stay runnable directly in a terminal you already have open.
+#
+set -euo pipefail
+
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+script="${1:?usage: omarchy-cloud-term <script-name> [args...]}"
+shift
+
+target="$BIN_DIR/$script"
+[[ -x "$target" ]] || { echo "omarchy-cloud-term: no such script: $script" >&2; exit 1; }
+
+# Omarchy terminals are translucent by default (ghostty ships
+# background-opacity 0.9), which leaves whatever window is behind showing
+# through a wizard people have to read while signing in. Force an opaque
+# window where the terminal supports it, and fall back to the generic launcher
+# everywhere else rather than guessing at flags.
+terminal="$(omarchy-default-terminal 2>/dev/null || true)"
+
+# setsid detaches from the shell process so the terminal outlives it. The
+# app-id matches Omarchy's own floating-terminal rules.
+if [[ "$terminal" == "ghostty" ]] && command -v ghostty >/dev/null 2>&1; then
+  exec setsid uwsm-app -- ghostty \
+    --class=org.omarchy.terminal \
+    --title="Omarchy Cloud" \
+    --background-opacity=1 \
+    -e "$target" "$@"
+fi
+
+exec setsid uwsm-app -- xdg-terminal-exec \
+  --app-id=org.omarchy.terminal \
+  --title="Omarchy Cloud" \
+  -e "$target" "$@"

@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Report cloud remote + mount state as JSON for the Omarchy Cloud plugin.
+
+Everything here is deliberately local and cheap: the config file is parsed
+directly rather than shelled out to, and mount state comes from
+/proc/self/mountinfo. The one network call in the whole plugin -- fetching
+storage usage -- lives behind `--with-quota` and a disk cache, because it costs
+a round trip per remote and the panel polls far too often to pay that.
+
+Usage:
+    omarchy-cloud-status [--root DIR] [--with-quota] [--quota-age SECONDS]
+"""
+
+import argparse
+import configparser
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Providers the wizard offers by name. Anything else still works -- it just
+# shows up under its raw rclone backend name.
+PROVIDER_LABELS = {
+    "drive": "Google Drive",
+    "dropbox": "Dropbox",
+    "onedrive": "OneDrive",
+    "box": "Box",
+    "pcloud": "pCloud",
+    "iclouddrive": "iCloud Drive",
+    "mega": "MEGA",
+    "s3": "S3",
+    "b2": "Backblaze B2",
+    "sftp": "SFTP",
+    "webdav": "WebDAV",
+    "koofr": "Koofr",
+    "yandex": "Yandex Disk",
+    "jottacloud": "Jottacloud",
+}
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy-cloud"
+STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-cloud"
+UNIT_PREFIX = "rclone-mount@"
+
+
+def run(command, timeout=5):
+    """Return (exit_code, stdout). Never raises -- callers get a non-zero code."""
+    try:
+        done = subprocess.run(
+            command, check=False, capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return done.returncode, done.stdout.strip()
+
+
+def which(name):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def config_path():
+    """Locate rclone.conf without assuming the default path."""
+    code, out = run(["rclone", "config", "file"])
+    if code == 0:
+        # Output is a two-line banner; the path is the last non-empty line.
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        if lines and lines[-1].startswith("/"):
+            return Path(lines[-1])
+    return Path.home() / ".config" / "rclone" / "rclone.conf"
+
+
+def read_remotes(path):
+    """Parse remote names and types. Never returns secrets."""
+    if not path.exists():
+        return []
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(path, encoding="utf-8")
+    except (OSError, configparser.Error):
+        return []
+
+    remotes = []
+    for name in parser.sections():
+        backend = parser[name].get("type", "")
+        remotes.append(
+            {
+                "name": name,
+                "type": backend,
+                # A provider name reads better than a remote id, but only while
+                # it identifies one service. Backends we have no name for fall
+                # back to what the user called it, which beats showing them the
+                # rclone backend id.
+                "label": PROVIDER_LABELS.get(backend, name),
+                "hasToken": bool(parser[name].get("token")),
+            }
+        )
+
+    # Two accounts on the same provider would otherwise be two rows both
+    # labelled "Google Drive", with nothing to tell them apart.
+    counts = {}
+    for remote in remotes:
+        counts[remote["label"]] = counts.get(remote["label"], 0) + 1
+    for remote in remotes:
+        if counts[remote["label"]] > 1 and remote["label"] != remote["name"]:
+            remote["label"] = f"{remote['label']} ({remote['name']})"
+
+    return remotes
+
+
+def mounted_paths():
+    """Every fuse.rclone mountpoint currently live, from the kernel."""
+    found = set()
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                # ... mountpoint options - fstype source superopts
+                parts = line.split(" - ")
+                if len(parts) < 2:
+                    continue
+                left = parts[0].split()
+                right = parts[1].split()
+                if len(left) < 5 or not right:
+                    continue
+                if right[0] not in ("fuse.rclone", "fuse"):
+                    continue
+                # mountinfo octal-escapes spaces and friends.
+                found.add(left[4].encode().decode("unicode_escape"))
+    except OSError:
+        return set()
+    return found
+
+
+def unit_states(names):
+    """One batched systemctl call for every remote's unit."""
+    states = {name: {"active": "inactive", "enabled": "disabled"} for name in names}
+    if not names:
+        return states
+
+    units = [f"{UNIT_PREFIX}{name}.service" for name in names]
+    code, out = run(
+        ["systemctl", "--user", "show", "--property=Id,ActiveState,UnitFileState", *units]
+    )
+    if code != 0 and not out:
+        return states
+
+    # `systemctl show` emits blank-line separated blocks, one per unit.
+    for block in out.split("\n\n"):
+        fields = {}
+        for line in block.splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                fields[key] = value
+        unit_id = fields.get("Id", "")
+        if not unit_id.startswith(UNIT_PREFIX):
+            continue
+        name = unit_id[len(UNIT_PREFIX):].removesuffix(".service")
+        if name in states:
+            states[name] = {
+                "active": fields.get("ActiveState", "inactive"),
+                "enabled": fields.get("UnitFileState", "disabled"),
+            }
+    return states
+
+
+def last_failure(name):
+    """A one-line reason a failed unit gave up, for the panel to show."""
+    code, out = run(
+        [
+            "journalctl", "--user", "-u", f"{UNIT_PREFIX}{name}.service",
+            "-n", "12", "--no-pager", "-o", "cat", "-p", "warning",
+        ],
+        timeout=4,
+    )
+    if code != 0 or not out:
+        return ""
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        # rclone prefixes real problems with these; skip its routine chatter.
+        if any(marker in line for marker in ("ERROR", "Failed to", "couldn't", "error")):
+            return line[:200]
+    return out.splitlines()[-1][:200] if out.splitlines() else ""
+
+
+def quota(name, max_age):
+    """Used/total bytes, cached on disk. Returns (used, total, known)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = CACHE_DIR / f"quota-{name}.json"
+
+    if cache_file.exists():
+        try:
+            age = time.time() - cache_file.stat().st_mtime
+            if age < max_age:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                return cached.get("used", 0), cached.get("total", 0), cached.get("known", False)
+        except (OSError, ValueError):
+            pass
+
+    code, out = run(["rclone", "about", f"{name}:", "--json"], timeout=25)
+    used, total, known = 0, 0, False
+    if code == 0 and out:
+        try:
+            data = json.loads(out)
+            used = int(data.get("used", 0) or 0)
+            total = int(data.get("total", 0) or 0)
+            known = total > 0
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        cache_file.write_text(
+            json.dumps({"used": used, "total": total, "known": known}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+    return used, total, known
+
+
+def classify(remote, mounted, unit):
+    """Collapse unit + mount + config into the one word the panel shows."""
+    if not remote["hasToken"] and remote["type"] in ("drive", "dropbox", "onedrive", "box", "pcloud", "iclouddrive"):
+        return "needs-auth"
+    if mounted and unit["active"] == "active":
+        return "mounted"
+    if unit["active"] in ("activating", "reloading"):
+        return "mounting"
+    if unit["active"] == "failed":
+        return "failed"
+    if mounted:
+        # Mounted but systemd does not think so -- someone mounted by hand.
+        return "mounted"
+    return "stopped"
+
+
+def expand_root(value):
+    return Path(os.path.expanduser(value or "~/Cloud"))
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--root", default="~/Cloud")
+    parser.add_argument("--with-quota", action="store_true")
+    parser.add_argument("--quota-age", type=int, default=1200)
+    args = parser.parse_args()
+
+    rclone = which("rclone")
+    root = expand_root(args.root)
+
+    if not rclone:
+        print(json.dumps({
+            "ok": True,
+            "rcloneInstalled": False,
+            "rcloneVersion": "",
+            "mountRoot": str(root),
+            "unitInstalled": False,
+            "remotes": [],
+        }))
+        return
+
+    _, version_out = run(["rclone", "version"])
+    version = ""
+    if version_out:
+        first = version_out.splitlines()[0].split()
+        version = first[1] if len(first) > 1 else ""
+
+    remotes = read_remotes(config_path())
+    live = mounted_paths()
+    states = unit_states([r["name"] for r in remotes])
+
+    unit_file = Path.home() / ".config" / "systemd" / "user" / f"{UNIT_PREFIX}.service"
+
+    rows = []
+    for remote in remotes:
+        name = remote["name"]
+        mount_path = str(root / name)
+        unit = states.get(name, {"active": "inactive", "enabled": "disabled"})
+        is_mounted = mount_path in live
+        state = classify(remote, is_mounted, unit)
+
+        row = {
+            "name": name,
+            "type": remote["type"],
+            "label": remote["label"],
+            "mountPath": mount_path,
+            "mounted": is_mounted,
+            "unitState": unit["active"],
+            "autoMount": unit["enabled"] in ("enabled", "enabled-runtime"),
+            "state": state,
+            "detail": "",
+            "usedBytes": 0,
+            "totalBytes": 0,
+            "quotaKnown": False,
+        }
+
+        if state == "failed":
+            row["detail"] = last_failure(name)
+
+        if args.with_quota and state == "mounted":
+            used, total, known = quota(name, args.quota_age)
+            row["usedBytes"] = used
+            row["totalBytes"] = total
+            row["quotaKnown"] = known
+
+        rows.append(row)
+
+    rows.sort(key=lambda r: r["name"].lower())
+
+    print(json.dumps({
+        "ok": True,
+        "rcloneInstalled": True,
+        "rcloneVersion": version,
+        "mountRoot": str(root),
+        "unitInstalled": unit_file.exists(),
+        "remotes": rows,
+    }))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001 - the panel needs JSON, always
+        print(json.dumps({"ok": False, "error": str(exc)[:300]}))
+        sys.exit(0)
