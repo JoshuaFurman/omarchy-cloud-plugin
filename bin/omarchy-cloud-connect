@@ -127,13 +127,75 @@ choose_name() {
 
 # ---------------------------------------------------------------- auth
 
-# The real test of whether a remote works. `rclone config create` takes the
-# default answer to every question it would otherwise ask, and for OAuth
-# backends that does not reliably run the browser flow -- so asking rclone
-# whether a token exists is not enough. Listing the root is.
+# Did the sign-in actually produce credentials? This is the precise question.
+# A network probe is not: a large drive, a slow link or a rate limit all make
+# it fail on a remote that authenticated perfectly, and treating that as
+# "needs signing in" sends the user through the whole browser flow a second
+# time for no reason.
+has_token() {
+  rclone config show "$1" 2>/dev/null | grep -qE '^token = .+'
+}
+
+# Backends that use OAuth prove themselves with a token. Everything else
+# (sftp, alias, s3 …) has no token to check, so fall back to actually reaching
+# the remote.
+needs_oauth() {
+  case "$1" in
+    drive|dropbox|onedrive|box|pcloud|yandex|jottacloud|iclouddrive) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 remote_works() {
-  rclone lsd "$1:" --max-depth 1 --retries 1 --low-level-retries 1 --timeout 20s \
-    >/dev/null 2>&1
+  rclone lsd "$1:" --retries 1 --low-level-retries 1 --timeout 20s >/dev/null 2>&1
+}
+
+connected() {
+  if needs_oauth "$PROVIDER_TYPE"; then has_token "$1"
+  else remote_works "$1"
+  fi
+}
+
+CLIENT_ID=""
+CLIENT_SECRET=""
+
+# Google is retiring the credentials rclone ships with, so this is a real
+# decision rather than an advanced option, and it belongs in our own words --
+# rclone raises it mid-flow as a bare y/n whose default is "no", which aborts
+# the sign-in for anyone who just presses enter.
+choose_credentials() {
+  [[ "$PROVIDER_TYPE" == "drive" ]] || return 0
+
+  heading "Google credentials"
+  echo "rclone ships shared Google credentials, but Google is retiring them:"
+  echo "rclone's own docs say they stop working during 2026. Your own take"
+  echo "about ten minutes to create, and aren't rate-limited by every other"
+  echo "rclone user in the world."
+  echo
+  echo "  https://rclone.org/drive/#making-your-own-client-id"
+  echo
+
+  local choice
+  choice="$(printf '%s\n' \
+    "Use my own Google credentials (recommended)" \
+    "Use rclone's shared credentials for now" |
+    gum choose --header "")" || abort "Cancelled."
+
+  case "$choice" in
+    "Use my own"*)
+      CLIENT_ID="$(gum input --placeholder "client ID (ends in .apps.googleusercontent.com)" --width 70)" || abort "Cancelled."
+      CLIENT_SECRET="$(gum input --password --placeholder "client secret")" || abort "Cancelled."
+      if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" ]]; then
+        warn "Both values are needed. Falling back to the shared credentials."
+        CLIENT_ID=""
+        CLIENT_SECRET=""
+      fi
+      ;;
+    *)
+      warn "rclone will ask you to confirm using its shared credentials."
+      warn "Answer y. You'll need to redo this before the end of 2026."
+      ;;
+  esac
 }
 
 create_remote() {
@@ -143,31 +205,47 @@ create_remote() {
   # Ask for the whole drive rather than rclone's narrower default, so files
   # created outside rclone are visible too.
   [[ "$PROVIDER_TYPE" == "drive" ]] && create_args+=(scope=drive)
+  [[ -n "$CLIENT_ID" ]] && create_args+=("client_id=$CLIENT_ID")
+  [[ -n "$CLIENT_SECRET" ]] && create_args+=("client_secret=$CLIENT_SECRET")
 
-  if ! rclone "${create_args[@]}" >/dev/null 2>&1; then
+  # Said before rclone starts, because rclone opens the browser itself the
+  # moment it gets there. Printing this afterwards describes something that has
+  # already happened.
+  if needs_oauth "$PROVIDER_TYPE"; then
+    echo "A browser window will open so you can sign in to $PROVIDER_LABEL."
+    echo "Approve access, then come back here."
+    [[ -z "$CLIENT_ID" ]] &&
+      warn "First, rclone asks whether to use its shared credentials — answer y."
+    echo
+  fi
+
+  # --no-output stops rclone echoing the finished config, which includes the
+  # OAuth token, into a terminal window sitting on the user's screen.
+  # Interactive prompts are unaffected, so nothing is hidden that has to be
+  # answered.
+  if ! rclone "${create_args[@]}" --no-output; then
     abort "rclone could not create the remote. Try 'rclone config' by hand."
   fi
   CREATED_REMOTE="$REMOTE_NAME"
 
-  if remote_works "$REMOTE_NAME"; then
+  if connected "$REMOTE_NAME"; then
     good "Connected."
     return 0
   fi
 
-  # Expected for OAuth providers: the remote exists but has no token yet.
-  echo "A browser window will open so you can sign in to $PROVIDER_LABEL."
-  echo "Come back here once you've approved access."
+  # rclone runs the sign-in during create, so reaching here means it did not
+  # complete -- a declined prompt, a closed browser, a cancelled consent.
+  # Offer one retry rather than silently leaving a remote that cannot work.
+  warn "Sign-in didn't complete."
   echo
-  gum confirm "Open the browser now?" || { cleanup_partial; abort "Cancelled."; }
+  gum confirm --default=false "Try signing in again?" || { cleanup_partial; abort "Cancelled."; }
 
-  if ! rclone config reconnect "$REMOTE_NAME:"; then
+  # `config update` re-runs the OAuth flow exactly as `config reconnect` does,
+  # but accepts --no-output; reconnect rejects the flag and would echo the new
+  # token to the screen.
+  if ! rclone config update "$REMOTE_NAME" --no-output || ! connected "$REMOTE_NAME"; then
     cleanup_partial
-    abort "Sign-in did not complete."
-  fi
-
-  if ! remote_works "$REMOTE_NAME"; then
-    cleanup_partial
-    abort "Signed in, but $PROVIDER_LABEL still isn't reachable. Check 'rclone config'."
+    abort "Sign-in did not complete. Nothing was saved."
   fi
 
   good "Connected."
@@ -277,6 +355,7 @@ main() {
   ensure_rclone
   choose_provider
   choose_name
+  choose_credentials
   create_remote
   provider_options
   save_remote_config

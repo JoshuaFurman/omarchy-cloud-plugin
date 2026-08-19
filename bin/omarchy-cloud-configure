@@ -115,6 +115,48 @@ configure_autostart() {
   fi
 }
 
+# Google's retirement of rclone's shared credentials makes this a migration
+# path, not a tuning knob: an existing connection built on the shared ID will
+# stop working during 2026 and has to move to its own credentials.
+credentials_current() {
+  local id
+  id="$(rclone config show "$REMOTE_NAME" 2>/dev/null | awk -F' = ' '/^client_id/ {print $2; exit}')"
+  [[ -n "$id" ]] && echo "your own" || echo "rclone's shared (retiring during 2026)"
+}
+
+configure_credentials() {
+  heading "Google credentials"
+  echo "Currently: $(credentials_current)"
+  echo
+  echo "rclone's shared credentials stop working during 2026. Your own take"
+  echo "about ten minutes to create:"
+  echo "  https://rclone.org/drive/#making-your-own-client-id"
+  echo
+
+  gum confirm "Switch this service to your own credentials?" || return 0
+
+  local id secret
+  id="$(gum input --placeholder "client ID (ends in .apps.googleusercontent.com)" --width 70)" || return 0
+  secret="$(gum input --password --placeholder "client secret")" || return 0
+  [[ -n "$id" && -n "$secret" ]] || { bad "Both values are needed."; return 0; }
+
+  rclone config update "$REMOTE_NAME" "client_id=$id" "client_secret=$secret" >/dev/null || {
+    bad "Could not save the credentials."
+    return 0
+  }
+
+  # New credentials mean the old token is worthless -- it was issued to the
+  # previous client. Signing in again is required, not optional.
+  say "Credentials saved. Signing in again with them…"
+  echo
+  if rclone config update "$REMOTE_NAME" --no-output; then
+    remount
+    good "Done."
+  else
+    bad "Sign-in did not complete. The service may not work until it does."
+  fi
+}
+
 configure_flags() {
   heading "Extra rclone flags"
   echo "Appended to the mount command. Leave empty for none."
@@ -135,7 +177,10 @@ disconnect_service() {
   echo "Nothing stored in the cloud is deleted."
   echo
 
-  gum confirm "Disconnect $label?" || return 0
+  # --default=false matters here: gum confirm otherwise defaults to Yes, so
+  # landing on this entry and pressing enter would disconnect a working
+  # service. Destructive actions default to the safe answer.
+  gum confirm --default=false "Disconnect $label?" || return 0
   "$MOUNT" forget "$REMOTE_NAME" --yes
   good "Disconnected."
   exit 0
@@ -148,7 +193,10 @@ main() {
     title "$label settings"
 
     local -a options=()
-    [[ "$REMOTE_TYPE" == "drive" ]] && options+=("Google Docs handling — $(gdocs_current)")
+    if [[ "$REMOTE_TYPE" == "drive" ]]; then
+      options+=("Google Docs handling — $(gdocs_current)")
+      options+=("Google credentials — $(credentials_current)")
+    fi
     options+=("Mount at login")
     options+=("Extra rclone flags")
     options+=("Disconnect this service")
@@ -159,6 +207,7 @@ main() {
 
     case "$choice" in
       "Google Docs handling"*)   configure_gdocs ;;
+      "Google credentials"*)     configure_credentials ;;
       "Mount at login")          configure_autostart ;;
       "Extra rclone flags")      configure_flags ;;
       "Disconnect this service") disconnect_service ;;

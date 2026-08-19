@@ -16,7 +16,9 @@ title "Sign in to $name"
 echo "A browser window will open. Approve access, then come back here."
 echo
 
-if rclone config reconnect "$name:"; then
+# --no-output keeps the refreshed token off the screen; `config reconnect`
+# runs the same flow but rejects the flag.
+if rclone config update "$name" --no-output; then
   good "Signed in."
   systemctl --user restart "rclone-mount@$name.service" 2>/dev/null || true
 else

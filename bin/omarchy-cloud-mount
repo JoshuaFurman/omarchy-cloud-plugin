@@ -55,6 +55,23 @@ remote_exists() {
   rclone listremotes 2>/dev/null | grep -qx "$1:"
 }
 
+# Keep a rolling set of copies of rclone.conf. Credentials are the only thing
+# in this plugin that cost real effort to recreate.
+backup_config() {
+  local conf backup_dir
+  conf="$HOME/.config/rclone/rclone.conf"
+  backup_dir="$CONFIG_DIR/backups"
+  [[ -s "$conf" ]] || return 0
+
+  mkdir -p "$backup_dir"
+  cp -p "$conf" "$backup_dir/rclone.conf.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || return 0
+  # Keep the ten most recent; these are small and hold live tokens.
+  ls -1t "$backup_dir"/rclone.conf.* 2>/dev/null | tail -n +11 | while read -r old; do
+    rm -f "$old"
+  done
+  chmod 700 "$backup_dir" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------- settings
 
 cmd_settings() {
@@ -225,6 +242,12 @@ cmd_forget() {
     echo "Nothing in the cloud is deleted. Re-run with --yes to confirm."
     return 1
   fi
+
+  # rclone.conf holds every service's credentials, and rewriting it is the one
+  # step here that cannot be undone by signing in again to this one service.
+  # A timestamped copy makes an unintended disconnect -- or a rewrite that gets
+  # interrupted partway -- recoverable.
+  backup_config
 
   cmd_disable "$name"
   "$(dirname "$SELF")/omarchy-cloud-bookmark" remove "$MOUNT_ROOT/$name" 2>/dev/null || true
