@@ -14,34 +14,68 @@ source "$BIN_DIR/omarchy-cloud-rclone-config.sh"
 trap hold_open EXIT
 
 name="${1:?usage: omarchy-cloud-reconnect <service>}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-cloud"
+REMOTE_FILE="$CONFIG_DIR/remotes/$name.conf"
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && -f "$REMOTE_FILE" && ! -L "$REMOTE_FILE" ]] || {
+  bad "'$name' is not managed by furmware.cloud."
+  exit 1
+}
 remote_type="$(rclone config show "$name" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
 [[ -n "$remote_type" ]] || { bad "No connected service called '$name'."; exit 1; }
+
+uses_oauth() {
+  case "$1" in
+    drive|dropbox|onedrive|box|pcloud|yandex|jottacloud) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 title "Sign in to $name"
 if [[ "$remote_type" == "iclouddrive" ]]; then
   echo "Apple will send a verification prompt to a trusted device."
   echo "Enter the 2FA code here when rclone asks for it."
-else
+elif uses_oauth "$remote_type"; then
   echo "A browser window will open. Approve access, then come back here."
+else
+  echo "rclone will ask for this backend's connection details."
 fi
 echo
 
-# --no-output keeps refreshed OAuth tokens off the screen. iCloud needs its
-# JSON state protocol driven explicitly or rclone submits a blank 2FA code.
+# Stop first so rclone cannot keep using or overwrite credentials while they
+# are refreshed. Preserve whether the service should be started afterwards.
+was_active=false
+was_enabled=false
+"$MOUNT" is-active "$name" 2>/dev/null && was_active=true
+"$MOUNT" is-enabled "$name" 2>/dev/null && was_enabled=true
+if ! "$MOUNT" stop "$name"; then
+  bad "Could not stop the mount safely. Sign-in was not changed."
+  exit 1
+fi
+
+# iCloud needs its JSON state protocol driven explicitly or rclone submits a
+# blank 2FA code. OAuth has a dedicated reconnect flow; other backends revisit
+# all of their connection settings.
 status=0
 if [[ "$remote_type" == "iclouddrive" ]]; then
   run_icloud_config "$name" config update "$name" || status=$?
+elif uses_oauth "$remote_type"; then
+  rclone config reconnect "$name:" || status=$?
 else
-  rclone config update "$name" --no-output || status=$?
+  rclone config update "$name" --all --no-output || status=$?
 fi
 
 if ((status == 0)); then
+  if [[ "$was_active" == "true" || "$was_enabled" == "true" ]]; then
+    if ! "$MOUNT" start "$name"; then
+      bad "Signed in, but the mount could not be started."
+      exit 1
+    fi
+  fi
   good "Signed in."
-  "$MOUNT" restart "$name" 2>/dev/null || true
 elif ((status == 130)); then
-  bad "Cancelled."
+  bad "Cancelled. The mount was left stopped and can be started from the panel."
   exit 130
 else
-  bad "Sign-in did not complete."
+  bad "Sign-in did not complete. The mount was left stopped."
   exit 1
 fi

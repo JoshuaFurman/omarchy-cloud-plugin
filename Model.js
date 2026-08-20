@@ -12,6 +12,7 @@ var GLYPH_ALERT    = "󰧠"
 var GLYPH_ADD      = "󰐕"
 var GLYPH_OPEN     = "󰏌"
 var GLYPH_SETTINGS = "󰒓"
+var GLYPH_RECONNECT = "󰑓"
 
 // Worst-first. The bar shows one icon for everything, so it has to show the
 // state that most deserves attention rather than the most common one.

@@ -16,15 +16,9 @@ BOOKMARKS="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookmarks"
 # safe remote names, but the mount root is user-supplied and can contain
 # spaces, so encode anything that is not an unreserved character or a slash.
 encode_uri() {
-  local input="$1" out="" i char
-  for ((i = 0; i < ${#input}; i++)); do
-    char="${input:i:1}"
-    case "$char" in
-      [A-Za-z0-9._~/-]) out+="$char" ;;
-      *) out+="$(printf '%%%02X' "'$char")" ;;
-    esac
-  done
-  printf 'file://%s' "$out"
+  python3 -c \
+    'import sys, urllib.parse; print("file://" + urllib.parse.quote(sys.argv[1], safe="/"), end="")' \
+    "$1"
 }
 
 ensure_file() {

@@ -71,15 +71,24 @@ Item {
 
   // ---------------------------------------------------------------- reading
 
-  property bool _wantQuota: false
+  property bool _statusIncludesQuota: false
+  property bool _quotaPending: false
 
   function refresh(withQuota) {
-    if (statusProcess.running) return
-    _wantQuota = withQuota === true
+    if (statusProcess.running) {
+      // A cheap poll may already be running when the slow quota timer fires.
+      // Remember that request; otherwise two aligned repeating timers can
+      // starve quota refreshes forever.
+      if (withQuota === true && !_statusIncludesQuota) _quotaPending = true
+      return
+    }
+    var includeQuota = withQuota === true || _quotaPending
+    _quotaPending = false
+    _statusIncludesQuota = includeQuota
     refreshing = true
 
     var args = [statusScript, "--root", configuredRoot]
-    if (_wantQuota) args.push("--with-quota")
+    if (includeQuota) args.push("--with-quota")
     args.push("--quota-age", String(quotaIntervalMin * 60))
 
     statusProcess.command = ["python3"].concat(args)
@@ -287,6 +296,8 @@ Item {
       root.refreshing = false
       if (exitCode === 0) root.applyStatus(statusOut.text)
       else root.lastError = String(statusErr.text || "Could not read cloud status").substring(0, 160)
+      root._statusIncludesQuota = false
+      if (root._quotaPending) Qt.callLater(function() { root.refresh(true) })
     }
   }
 

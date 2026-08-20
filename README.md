@@ -35,6 +35,11 @@ Click the cloud icon in the bar, then **Connect a service…**. A terminal opens
 and asks which provider to use, what to call the folder, and any credentials or
 provider-specific choices it needs.
 
+For another rclone backend, choose **Something else (guided by rclone)** and
+enter its backend name. rclone then asks the complete provider-specific set of
+questions; for example, SFTP asks for its host and user instead of silently
+creating an empty connection.
+
 OAuth services sign in through your browser. iCloud uses your regular Apple
 Account password and then asks for a 2FA code in the terminal. When sign-in
 finishes, the folder is mounted, bookmarked in the Files sidebar, and set to
@@ -51,7 +56,7 @@ marker. Existing rclone remotes not created by this plugin are ignored.
 | Path | What |
 |------|------|
 | `~/Cloud/<name>/` | Where each service is mounted |
-| `~/.config/rclone/rclone.conf` | rclone credentials for services you explicitly connect |
+| rclone's active config (normally `~/.config/rclone/rclone.conf`) | Credentials for services you explicitly connect; the plugin honors the path reported by `rclone config file` |
 | `~/.config/omarchy-cloud/settings.conf` | Mount flags, read by systemd at login |
 | `~/.config/omarchy-cloud/remotes/<name>.conf` | Per-service mount flags and plugin ownership record |
 | `~/.config/systemd/user/omarchy-cloud-mount@.service` | Generated systemd user unit |
@@ -62,8 +67,10 @@ Connecting or disconnecting a service changes rclone's credential file only
 after an explicit action and never deletes provider-side data. The plugin never
 copies or backs up `rclone.conf`: disconnect asks rclone to remove only the
 selected remote and verifies that it is gone, leaving every unrelated remote
-untouched. On upgrade, obsolete full-config backups created by Cloud 0.2.0 and
-earlier are deleted automatically.
+untouched. It also refuses to disconnect a remote without its own ownership
+record, and keeps that record if stopping the mount or deleting credentials
+cannot be verified. Obsolete full-config backups created by Cloud 0.2.0 and
+earlier are deleted the next time a plugin helper runs.
 
 Installing the `rclone` package is the only system-level operation; it is
 initiated separately through Omarchy's package manager as described above.
@@ -98,8 +105,11 @@ available per service under **Settings → Google Docs handling**:
 
 **The shared OAuth credentials are rate-limited.** rclone's built-in Google
 client ID is shared by every rclone user, and throttles under load. For a
-large Drive, create your own client ID and set it with
-`rclone config update <name> client_id=... client_secret=...`.
+large Drive, create your own client ID and switch under **Settings → Google
+credentials**. The plugin stops the mount, saves the new client, runs rclone's
+dedicated reconnect flow, and starts the mount again only after sign-in works.
+Use a client ID you created yourself rather than credentials shared by someone
+else; a client ID can expose relationships between accounts that use it.
 
 ## Per-service settings
 
@@ -111,6 +121,9 @@ permanent:
 - **Extra rclone flags** — anything from that backend's rclone page
 - **Disconnect this service** — unmount, delete the saved sign-in, drop the
   bookmark. Nothing in the cloud is touched.
+
+If a mount fails, its row offers both **Mount now** and **Sign in again** so an
+expired or revoked provider token can be repaired without using the terminal.
 
 Changing mount flags restarts that one mount so the change takes effect.
 

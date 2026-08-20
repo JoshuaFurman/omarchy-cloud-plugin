@@ -45,6 +45,7 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "om
 STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-cloud"
 UNIT_PREFIXES = ("omarchy-cloud-mount@", "rclone-mount@")
 REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+MOUNTINFO_ESCAPE_PATTERN = re.compile(r"\\([0-7]{3})")
 ICLOUD_STORAGE_URL = "https://setup.icloud.com/setup/ws/1/storageUsageInfo"
 ICLOUD_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -80,7 +81,11 @@ def config_path():
         lines = [line.strip() for line in out.splitlines() if line.strip()]
         if lines and lines[-1].startswith("/"):
             return Path(lines[-1])
-    return Path.home() / ".config" / "rclone" / "rclone.conf"
+    explicit = os.environ.get("RCLONE_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser()
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "rclone" / "rclone.conf"
 
 
 def managed_remote_names():
@@ -90,7 +95,9 @@ def managed_remote_names():
         return {
             path.stem
             for path in remote_dir.glob("*.conf")
-            if path.is_file() and REMOTE_NAME_PATTERN.fullmatch(path.stem)
+            if path.is_file()
+            and not path.is_symlink()
+            and REMOTE_NAME_PATTERN.fullmatch(path.stem)
         }
     except OSError:
         return set()
@@ -155,8 +162,14 @@ def mounted_paths():
                     continue
                 if right[0] not in ("fuse.rclone", "fuse"):
                     continue
-                # mountinfo octal-escapes spaces and friends.
-                found.add(left[4].encode().decode("unicode_escape"))
+                # mountinfo octal-escapes spaces and a few delimiters. Decode
+                # only those kernel escapes; unicode_escape would corrupt
+                # every non-ASCII character that was already valid UTF-8.
+                found.add(
+                    MOUNTINFO_ESCAPE_PATTERN.sub(
+                        lambda match: chr(int(match.group(1), 8)), left[4]
+                    )
+                )
     except OSError:
         return set()
     return found
@@ -164,7 +177,14 @@ def mounted_paths():
 
 def unit_states(names):
     """Read current and legacy user-unit state in one batched systemctl call."""
-    states = {name: {"active": "inactive", "enabled": "disabled"} for name in names}
+    states = {
+        name: {
+            "active": "inactive",
+            "enabled": "disabled",
+            "unit": f"{UNIT_PREFIXES[0]}{name}.service",
+        }
+        for name in names
+    }
     if not names:
         return states
 
@@ -209,17 +229,18 @@ def unit_states(names):
             candidate = {
                 "active": fields.get("ActiveState", "inactive"),
                 "enabled": fields.get("UnitFileState", "disabled"),
+                "unit": unit_id,
             }
             if priority(candidate) > priority(states[name]):
                 states[name] = candidate
     return states
 
 
-def last_failure(name):
+def last_failure(unit):
     """A one-line reason a failed unit gave up, for the panel to show."""
     code, out = run(
         [
-            "journalctl", "--user", "-u", f"{UNIT_PREFIX}{name}.service",
+            "journalctl", "--user", "-u", unit,
             "-n", "12", "--no-pager", "-o", "cat", "-p", "warning",
         ],
         timeout=4,
@@ -315,7 +336,8 @@ def quota(name, backend, max_age, rclone_config, refresh):
 def classify(remote, mounted, unit):
     """Collapse unit + mount + config into the one word the panel shows."""
     authenticated_types = (
-        "drive", "dropbox", "onedrive", "box", "pcloud", "iclouddrive"
+        "drive", "dropbox", "onedrive", "box", "pcloud", "iclouddrive",
+        "yandex", "jottacloud",
     )
     if not remote["hasAuth"] and remote["type"] in authenticated_types:
         return "needs-auth"
@@ -374,7 +396,11 @@ def main():
     for remote in remotes:
         name = remote["name"]
         mount_path = str(root / name)
-        unit = states.get(name, {"active": "inactive", "enabled": "disabled"})
+        unit = states.get(name, {
+            "active": "inactive",
+            "enabled": "disabled",
+            "unit": f"{UNIT_PREFIXES[0]}{name}.service",
+        })
         is_mounted = mount_path in live
         state = classify(remote, is_mounted, unit)
 
@@ -394,7 +420,7 @@ def main():
         }
 
         if state == "failed":
-            row["detail"] = last_failure(name)
+            row["detail"] = last_failure(unit["unit"])
 
         if state == "mounted":
             used, total, known = quota(

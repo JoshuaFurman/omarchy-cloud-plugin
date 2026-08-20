@@ -26,6 +26,8 @@ trap hold_open EXIT
 
 abort() {
   echo
+  cleanup_partial
+  CREATED_REMOTE=""
   bad "$*"
   exit 1
 }
@@ -36,9 +38,10 @@ abort() {
 # to be useful.
 CREATED_REMOTE=""
 cleanup_partial() {
-  [[ -n "$CREATED_REMOTE" ]] || return 0
+  [[ -n "${CREATED_REMOTE:-}" ]] || return 0
   warn "Removing the half-configured '$CREATED_REMOTE' remote."
   rclone config delete "$CREATED_REMOTE" 2>/dev/null || true
+  rm -f "$REMOTE_DIR/$CREATED_REMOTE.conf"
 }
 
 # ---------------------------------------------------------------- rclone
@@ -61,6 +64,7 @@ ensure_rclone() {
 PROVIDER_LABEL=""
 PROVIDER_TYPE=""
 PROVIDER_DEFAULT_NAME=""
+CUSTOM_PROVIDER=false
 
 choose_provider() {
   heading "Which service do you want to connect?"
@@ -70,7 +74,7 @@ choose_provider() {
     "Google Drive" \
     "Dropbox" \
     "OneDrive" \
-    "Something else (any rclone backend)" |
+    "Something else (guided by rclone)" |
     gum choose --header "")" || abort "Cancelled."
 
   case "$choice" in
@@ -78,7 +82,8 @@ choose_provider() {
     "Dropbox")      PROVIDER_LABEL="Dropbox";      PROVIDER_TYPE="dropbox";  PROVIDER_DEFAULT_NAME="dropbox" ;;
     "OneDrive")     PROVIDER_LABEL="OneDrive";     PROVIDER_TYPE="onedrive"; PROVIDER_DEFAULT_NAME="onedrive" ;;
     *)
-      heading "Any rclone backend"
+      CUSTOM_PROVIDER=true
+      heading "Another rclone backend"
       echo "Enter the rclone backend name, for example: pcloud, box, s3, sftp."
       echo "Full list: https://rclone.org/overview/"
       echo
@@ -86,7 +91,7 @@ choose_provider() {
       [[ -n "$PROVIDER_TYPE" ]] || abort "No backend given."
       PROVIDER_LABEL="$PROVIDER_TYPE"
       PROVIDER_DEFAULT_NAME="$PROVIDER_TYPE"
-      warn "Backends outside the tested three may ask questions this wizard cannot answer."
+      say "rclone will guide you through this backend's provider-specific questions."
       ;;
   esac
 }
@@ -207,6 +212,7 @@ choose_credentials() {
   echo "rclone's own docs say they stop working during 2026. Your own take"
   echo "about ten minutes to create, and aren't rate-limited by every other"
   echo "rclone user in the world."
+  echo "Use a client ID you created yourself, not one shared by another person."
   echo
   echo "  https://rclone.org/drive/#making-your-own-client-id"
   echo
@@ -277,8 +283,12 @@ create_remote() {
       abort "rclone could not create the remote. Try 'rclone config' by hand."
     fi
   else
-    # Keep the finished config (including its OAuth token) off the terminal.
-    if ! rclone "${create_args[@]}" --no-output; then
+    # Custom backends need their provider-specific questions (host, bucket,
+    # endpoint, credentials, and so on). --all asks those instead of silently
+    # accepting unusable empty defaults. Keep completed secrets off the screen.
+    local -a create_options=(--no-output)
+    [[ "$CUSTOM_PROVIDER" == "true" ]] && create_options=(--all --no-output)
+    if ! rclone "${create_args[@]}" "${create_options[@]}"; then
       cleanup_partial
       CREATED_REMOTE=""
       abort "rclone could not create the remote. Try 'rclone config' by hand."
@@ -297,14 +307,16 @@ create_remote() {
   echo
   gum confirm --default=false "Try signing in again?" || { cleanup_partial; abort "Cancelled."; }
 
-  # `config update` re-runs authentication exactly as `config reconnect` does.
-  # iCloud needs the same explicit state driver for its new 2FA code; OAuth
-  # providers can keep their completed config (including the token) hidden.
+  # iCloud needs the explicit state driver for its new 2FA code. OAuth
+  # providers have a dedicated reconnect flow; non-OAuth backends must revisit
+  # all provider-specific settings rather than accepting empty defaults.
   local retry_ok=false
   if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
     run_icloud_config "$REMOTE_NAME" config update "$REMOTE_NAME" && retry_ok=true
+  elif uses_oauth "$PROVIDER_TYPE"; then
+    rclone config reconnect "$REMOTE_NAME:" && retry_ok=true
   else
-    rclone config update "$REMOTE_NAME" --no-output && retry_ok=true
+    rclone config update "$REMOTE_NAME" --all --no-output && retry_ok=true
   fi
   if [[ "$retry_ok" != "true" ]] || ! connected "$REMOTE_NAME"; then
     cleanup_partial
@@ -361,13 +373,17 @@ choose_gdocs_mode() {
 }
 
 save_remote_config() {
-  mkdir -p "$REMOTE_DIR"
+  local tmp
+  mkdir -p "$REMOTE_DIR" || return 1
+  tmp="$(mktemp "$REMOTE_DIR/.${REMOTE_NAME}.XXXXXX")" || return 1
   {
     printf '# Written by omarchy-cloud-connect for the %q remote.\n' "$REMOTE_NAME"
     echo "# extra_flags is appended to the rclone mount command line."
     printf 'label=%q\n' "$PROVIDER_LABEL"
     printf 'extra_flags=%q\n' "$EXTRA_FLAGS"
-  } >"$REMOTE_DIR/$REMOTE_NAME.conf"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$REMOTE_DIR/$REMOTE_NAME.conf"
 }
 
 # ---------------------------------------------------------------- mount
@@ -392,6 +408,12 @@ mount_it() {
     abort "systemd could not start the mount. See: journalctl --user -u omarchy-cloud-mount@$REMOTE_NAME"
   fi
 
+  # A bookmark represents a connected service, not just its current process.
+  # Add it before waiting so a slow first mount still appears in Files.
+  if ! "$BOOKMARK" add "$mount_point" "$PROVIDER_LABEL" 2>/dev/null; then
+    warn "Could not add the Files sidebar bookmark."
+  fi
+
   # `systemctl enable --now` returns as soon as the unit is active, and with
   # Type=notify that already means the mountpoint is live. Confirm anyway --
   # a bookmark pointing at nothing is the one outcome worth preventing.
@@ -406,7 +428,6 @@ mount_it() {
     fi
   done
 
-  "$BOOKMARK" add "$mount_point" "$PROVIDER_LABEL" 2>/dev/null || true
   good "Mounted at $mount_point"
 }
 
@@ -421,7 +442,7 @@ main() {
   choose_credentials
   create_remote
   provider_options
-  save_remote_config
+  save_remote_config || abort "Could not save the plugin's ownership record."
   # Past this point the remote is real and worth keeping even if mounting
   # fails, so stop offering to tear it down.
   CREATED_REMOTE=""

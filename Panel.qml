@@ -500,6 +500,16 @@ Panel {
       }
 
       PanelActionButton {
+        visible: remoteRow.isFailed
+        iconText: Model.GLYPH_RECONNECT
+        tooltipText: "Sign in again"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: root.reconnect(remoteRow.remote)
+      }
+
+      PanelActionButton {
         visible: !remoteRow.needsAuth
         iconText: remoteRow.isMounted ? Model.GLYPH_OPEN : Model.GLYPH_MOUNTED
         tooltipText: remoteRow.isMounted ? "Open in Files" : "Mount now"

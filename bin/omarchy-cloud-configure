@@ -19,6 +19,14 @@ trap hold_open EXIT
 
 REMOTE_NAME="${1:-}"
 [[ -n "$REMOTE_NAME" ]] || { bad "usage: omarchy-cloud-configure <service>"; exit 1; }
+[[ "$REMOTE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || {
+  bad "Invalid service name: '$REMOTE_NAME'."
+  exit 1
+}
+[[ -f "$REMOTE_DIR/$REMOTE_NAME.conf" && ! -L "$REMOTE_DIR/$REMOTE_NAME.conf" ]] || {
+  bad "'$REMOTE_NAME' is not managed by furmware.cloud."
+  exit 1
+}
 
 REMOTE_TYPE="$(rclone config show "$REMOTE_NAME" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
 [[ -n "$REMOTE_TYPE" ]] || { bad "No connected service called '$REMOTE_NAME'."; exit 1; }
@@ -29,13 +37,17 @@ extra_flags=""
 [[ -f "$REMOTE_DIR/$REMOTE_NAME.conf" ]] && source "$REMOTE_DIR/$REMOTE_NAME.conf"
 
 save() {
-  mkdir -p "$REMOTE_DIR"
+  local tmp
+  mkdir -p "$REMOTE_DIR" || return 1
+  tmp="$(mktemp "$REMOTE_DIR/.${REMOTE_NAME}.XXXXXX")" || return 1
   {
     printf '# Written by omarchy-cloud-configure for the %q remote.\n' "$REMOTE_NAME"
     echo "# extra_flags is appended to the rclone mount command line."
     printf 'label=%q\n' "$label"
     printf 'extra_flags=%q\n' "$extra_flags"
-  } >"$REMOTE_DIR/$REMOTE_NAME.conf"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$REMOTE_DIR/$REMOTE_NAME.conf"
 }
 
 # Mount flags are read at start, so a change only takes effect on a restart.
@@ -88,8 +100,8 @@ configure_gdocs() {
   esac
   extra_flags="$(sed 's/^ *//; s/ *$//' <<<"$extra_flags")"
 
-  save
-  remount
+  save || { bad "Could not save the Google Docs setting."; return 0; }
+  remount || { bad "Saved, but the mount could not be restarted."; return 0; }
   good "Saved."
 }
 
@@ -105,8 +117,11 @@ configure_autostart() {
 
   if [[ "$now" == "on" ]]; then
     if gum confirm "Stop mounting this at login?"; then
-      "$MOUNT" disable "$REMOTE_NAME" >/dev/null 2>&1
-      good "It will no longer mount at login."
+      if "$MOUNT" disable "$REMOTE_NAME" >/dev/null 2>&1; then
+        good "It will no longer mount at login."
+      else
+        bad "Could not stop and disable the mount. Its settings were not removed."
+      fi
     fi
   else
     if gum confirm "Mount this automatically at login?"; then
@@ -135,12 +150,21 @@ configure_credentials() {
 
   gum confirm "Switch this service to your own credentials?" || return 0
 
-  local id secret
+  local id secret was_active=false was_enabled=false
   id="$(gum input --placeholder "client ID (ends in .apps.googleusercontent.com)" --width 70)" || return 0
   secret="$(gum input --password --placeholder "client secret")" || return 0
   [[ -n "$id" && -n "$secret" ]] || { bad "Both values are needed."; return 0; }
 
-  rclone config update "$REMOTE_NAME" "client_id=$id" "client_secret=$secret" >/dev/null || {
+  "$MOUNT" is-active "$REMOTE_NAME" 2>/dev/null && was_active=true
+  "$MOUNT" is-enabled "$REMOTE_NAME" 2>/dev/null && was_enabled=true
+  if ! "$MOUNT" stop "$REMOTE_NAME"; then
+    bad "Could not stop the mount safely. Credentials were not changed."
+    return 0
+  fi
+
+  rclone config update "$REMOTE_NAME" \
+    "client_id=$id" "client_secret=$secret" \
+    config_refresh_token=false --no-output >/dev/null || {
     bad "Could not save the credentials."
     return 0
   }
@@ -149,11 +173,16 @@ configure_credentials() {
   # previous client. Signing in again is required, not optional.
   say "Credentials saved. Signing in again with them…"
   echo
-  if rclone config update "$REMOTE_NAME" --no-output; then
-    remount
-    good "Done."
+  if rclone config reconnect "$REMOTE_NAME:"; then
+    if [[ "$was_active" == "true" || "$was_enabled" == "true" ]]; then
+      if ! "$MOUNT" start "$REMOTE_NAME"; then
+        bad "Signed in, but the mount could not be started."
+        return 0
+      fi
+    fi
+    good "Credentials updated and sign-in completed."
   else
-    bad "Sign-in did not complete. The service may not work until it does."
+    bad "Sign-in did not complete. The mount was left stopped so the old process cannot keep using the retired credentials."
   fi
 }
 
@@ -166,8 +195,8 @@ configure_flags() {
   local entered
   entered="$(gum input --value "$extra_flags" --width 70 --placeholder "--flag value")" || return 0
   extra_flags="$entered"
-  save
-  remount
+  save || { bad "Could not save the extra flags."; return 0; }
+  remount || { bad "Saved, but the mount could not be restarted."; return 0; }
   good "Saved."
 }
 
@@ -181,7 +210,10 @@ disconnect_service() {
   # landing on this entry and pressing enter would disconnect a working
   # service. Destructive actions default to the safe answer.
   gum confirm --default=false "Disconnect $label?" || return 0
-  "$MOUNT" forget "$REMOTE_NAME" --yes
+  if ! "$MOUNT" forget "$REMOTE_NAME" --yes; then
+    bad "Disconnect did not complete. Credentials and plugin metadata were kept where possible."
+    return 0
+  fi
   good "Disconnected."
   exit 0
 }
